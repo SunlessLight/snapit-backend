@@ -108,6 +108,11 @@ async function processJob(jobId, file, body) {
 
         jobs.set(jobId, { status: 'failed', data: null, error: errorMessage });
     }
+
+    // Inside processJob, after completion or failure:
+    setTimeout(() => {
+        jobs.delete(jobId);
+    }, 600000); // 10 minutes
 }
 
 app.listen(port, () => {
