@@ -7,39 +7,72 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 export async function generateMarketingCopy(imageBuffer, mimeType, params) {
     const { dishName, price, outputLanguage, backgroundVibe } = params;
 
-    const prompt = `
-        You are an expert digital marketing copywriter and an AI image prompt engineer. 
-        Analyze the uploaded food product image and the requested Visual Poster Style Context.
+    let backgroundVibeString = "";
 
-        Task 1: Marketing Copy
-        Write professional marketing copy for the product.
-        DishName: ${dishName}
+    switch (backgroundVibe.id) {
+        case 'kopitiam':
+            backgroundVibeString = "Classic Malaysian Kopitiam. White marble table surface with slight imperfections. Harsh, bright fluorescent overhead lighting. Authentic, traditional local feel.";
+            break;
+        case 'cafe':
+            backgroundVibeString = "Modern, bright aesthetic cafe. Light oak wood table surface. Soft, warm natural sunlight streaming from a window. Clean, inviting, and highly appetizing.";
+            break;
+        case 'street':
+            backgroundVibeString = "Night market or street food vibe. Dark, textured asphalt or stainless steel cart surface. Warm, glowing bokeh from neon signs or street lamps in the background. High contrast, energetic.";
+            break;
+        case 'premium':
+            backgroundVibeString = "High-end modern restaurant. Smooth, dark walnut wood or clean slate surface. Soft, elegant, diffused studio lighting. Minimalist, uncluttered, and highly professional.";
+            break;
+    }
+
+    const prompt = `
+        You are an expert Malaysian social media manager and an AI image prompt engineer. 
+        Analyze the uploaded food product image.
+
+        Context:
+        Dish Name: ${dishName}
         Price: ${price}
         Output Language: ${outputLanguage}
+        Background Vibe: ${backgroundVibeString}
 
-        Task 2: Background Generation Prompt
-        Based on the Visual Background Style Context: "${backgroundVibe}", write a highly detailed, photorealistic prompt for a generative background AI.
+        --- TASK 1: COPYWRITING (Title, Description, Caption) ---
+        CRITICAL RULES FOR ALL TEXT:
+        1. CURRENCY: Always use "RM" (e.g., RM 13.50). Never use "$".
+        2. TONE: Hungry, casual, and energetic. Must sound like a real Malaysian foodie, not a corporate brochure. 
+        3. BANNED WORDS: Do NOT use generic AI words like: "Indulge", "Exquisite", "Harmonious", "Whimsical", "Delightful", "Elevate", "Symphony", "Serene".
+
+        Provide the text for these specific fields:
+        - title: A short, punchy name for the dish (max 3-5 words).
+        - description: A 1-2 sentence description suitable for a digital menu. Keep it grounded, focusing on taste, texture, and ingredients.
+        - caption: A 3-sentence social media caption designed to drive foot traffic. 
+          Format: [Catchy Hook/Emoji] + [1 Sentence describing the best part of the food] + [Urgency/Call to Action with Price]. 
+          *Note: If Output Language is "Local Style", use casual Malaysian slang (e.g., 'Ngam ngam', 'Padu'). If "English", use casual English.*
+
+        --- TASK 2: BACKGROUND GENERATION PROMPT ---
+        Determine the camera perspective of the uploaded food image:
+        - Is it a Top-Down (flatlay) shot pointing straight down?
+        - Or is it an Angled/Profile shot showing depth?
+
+        Write the 'backgroundPrompt' based on the perspective and the Background Vibe ("${backgroundVibeString}").
         
         CRITICAL RULES FOR BACKGROUND PROMPT:
-        - DO NOT describe the food itself. The food is already cut out.
-        - Describe ONLY the surface the food sits on, the environment behind it, the lighting, and the depth of field.
-        - Example Good: "A rustic oak wood table surface, softly blurred bustling Italian cafe in the background, warm sunset lighting coming from a window on the left, high resolution."
-        - Example Bad: "A pepperoni pizza on a table." (Never mention the main subject).
+        1. DO NOT describe the food itself. The food is already cut out.
+        2. IF TOP-DOWN: Describe ONLY a flat surface texture directly beneath the food. Do NOT mention a background, room, or depth of field.
+        3. IF ANGLED: Describe the surface beneath the food AND a softly blurred environment behind it to create depth.
     `;
 
     const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash',
         contents: [
-            { text: prompt }, //[cite: 2]
+            { text: prompt },
             {
                 inlineData: {
-                    data: imageBuffer.toString("base64"), //[cite: 2]
+                    data: imageBuffer.toString("base64"),
                     mimeType: mimeType
                 }
             }
         ],
         config: {
-            responseMimeType: "application/json", //[cite: 2]
+            responseMimeType: "application/json",
             responseSchema: {
                 type: Type.OBJECT,
                 properties: {
@@ -48,18 +81,19 @@ export async function generateMarketingCopy(imageBuffer, mimeType, params) {
                     caption: { type: Type.STRING },
                     backgroundPrompt: { type: Type.STRING }
                 },
-                required: ["title", "description", "caption", "backgroundPrompt"] //[cite: 2]
+                required: ["title", "description", "caption", "backgroundPrompt"]
             }
         }
     });
 
-    if (!response || !response.text) { //[cite: 2]
+    if (!response || !response.text) {
         throw new Error("AI generation blocked by safety settings or returned an empty response.");
     }
 
-    const cleanText = response.text.replace(/^```json\s*/i, '').replace(/\s*```$/i, '').trim(); //[cite: 2]
+    const cleanText = response.text.replace(/^```json\s*/i, '').replace(/\s*```$/i, '').trim();
     return JSON.parse(cleanText);
-}
+
+};
 
 export async function processImageBackground(imageBuffer, originalName, backgroundPrompt, abortSignal) {
     const formData = new FormData();
