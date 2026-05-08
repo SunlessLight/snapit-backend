@@ -27,9 +27,11 @@ app.post('/api/generate', upload.single('image'), (req, res) => {
 
     // Extract text fields exactly as your old code did[cite: 1]
     const { dishName, price, outputLanguage, backgroundVibe } = req.body;
-    const textFields = [dishName, price, outputLanguage, backgroundVibe];
+    const shouldGenerateBg = generateBackground === "true";
+    const requiredFields = shouldGenerateBg ? [dishName, price, outputLanguage, backgroundVibe] : [dishName, price, outputLanguage];
 
-    if (textFields.some(field => typeof field !== 'string' || field.trim() === '')) {
+
+    if (requiredFields.some(field => typeof field !== 'string' || field.trim() === '')) {
         return res.status(400).json({
             success: false,
             error: `Missing required fields. Received: dishName(${dishName}), price(${price}), lang(${outputLanguage}), vibe(${backgroundVibe})`
@@ -63,6 +65,7 @@ async function processJob(jobId, file, body) {
         const imageBuffer = file.buffer;
         const mimeType = file.mimetype;
         const originalName = file.originalname;
+        const shouldGenerateBg = body.generateBackground === 'true';
 
         // Call your Gemini marketing copy service[cite: 1]
         const copyResult = await generateMarketingCopy(
@@ -71,13 +74,15 @@ async function processJob(jobId, file, body) {
             body
         );
 
-        // Call your Image Processing API[cite: 1]
-        const generatedImageBase64 = await processImageBackground(
-            imageBuffer,
-            originalName,
-            copyResult.backgroundPrompt,
-            abortController.signal
-        );
+        let generatedImageBase64 = null;
+        if (shouldGenerateBg) {
+            generatedImageBase64 = await processImageBackground(
+                imageBuffer,
+                originalName,
+                copyResult.backgroundPrompt,
+                abortController.signal
+            );
+        };
 
         // Save the successful payload identical to your old response structure[cite: 1]
         jobs.set(jobId, {
