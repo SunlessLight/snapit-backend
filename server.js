@@ -26,7 +26,7 @@ app.post('/api/generate', upload.single('image'), (req, res) => {
     }
 
     // Extract text fields exactly as your old code did[cite: 1]
-    const { dishName, price, outputLanguage, backgroundVibe } = req.body;
+    const { dishName, price, outputLanguage, backgroundVibe, generateBackground } = req.body;
     const shouldGenerateBg = generateBackground === "true";
     const requiredFields = shouldGenerateBg ? [dishName, price, outputLanguage, backgroundVibe] : [dishName, price, outputLanguage];
 
