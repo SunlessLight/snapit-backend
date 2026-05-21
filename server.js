@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
@@ -121,5 +122,5 @@ async function processJob(jobId, file, body) {
 }
 
 app.listen(port, () => {
-    console.log(`SnapIT backend listening on port ${port}`);
+    console.log(`✓ SnapIT backend listening on port ${port}`);
 });
