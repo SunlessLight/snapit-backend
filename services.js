@@ -5,8 +5,20 @@ import FormData from 'form-data';
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 export async function generateMarketingCopy(imageBuffer, mimeType, params) {
-    const { dishName, price, outputLanguage, backgroundVibe, generateBackground } = params;
+    const {
+        dishName, price, outputLanguage, backgroundVibe, generateBackground,
+        isContextPro, description, tone
+    } = params;
     const shouldGenerateBg = generateBackground === 'true';
+    const isPro = isContextPro === 'true';
+
+    const proBlock = isPro ? `
+        PRO CONTEXT — VENDOR-PROVIDED:
+        Tone Preference: ${tone}
+        Vendor's Own Description: "${description}"
+
+        When writing the title, description, and caption, lean into the "${tone}" tone (e.g., "luxury" = restrained and elegant; "funny" = playful, light jokes; "cozy" = warm and homey; "casual" = relaxed; "modern" = clean and current; "professional" = polished but never stiff). Weave any factual ingredient/origin details from the vendor's description into the description and caption naturally — do not quote it verbatim. The BANNED WORDS list below still applies regardless of tone.
+    ` : '';
 
     let backgroundVibeString = "";
 
@@ -36,7 +48,7 @@ export async function generateMarketingCopy(imageBuffer, mimeType, params) {
         Price: ${price}
         Output Language: ${outputLanguage}
         Background Vibe: ${backgroundVibeString}
-
+        ${proBlock}
         --- TASK 1: COPYWRITING (Title, Description, Caption) ---
         CRITICAL RULES FOR ALL TEXT:
         1. CURRENCY: Always use "RM" (e.g., RM 13.50). Never use "$".

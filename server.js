@@ -27,8 +27,12 @@ app.post('/api/generate', upload.single('image'), (req, res) => {
     }
 
     // Extract text fields exactly as your old code did[cite: 1]
-    const { dishName, price, outputLanguage, backgroundVibe, generateBackground } = req.body;
+    const {
+        dishName, price, outputLanguage, backgroundVibe, generateBackground,
+        isMediaEditorPro, isContextPro, description, tone
+    } = req.body;
     const shouldGenerateBg = generateBackground === "true";
+    const isPro = isContextPro === 'true';
     const requiredFields = shouldGenerateBg ? [dishName, price, outputLanguage, backgroundVibe] : [dishName, price, outputLanguage];
 
 
@@ -37,6 +41,17 @@ app.post('/api/generate', upload.single('image'), (req, res) => {
             success: false,
             error: `Missing required fields. Received: dishName(${dishName}), price(${price}), lang(${outputLanguage}), vibe(${backgroundVibe})`
         });
+    }
+
+    if (isPro && (typeof description !== 'string' || description.trim() === '' || typeof tone !== 'string' || tone.trim() === '')) {
+        return res.status(400).json({
+            success: false,
+            error: `Pro context enabled but missing required fields. Received: description("${description}"), tone("${tone}")`
+        });
+    }
+
+    if (isMediaEditorPro === 'true') {
+        console.log(`[/api/generate] Pro media editor enabled for dish: ${dishName}`);
     }
 
     // 2. Job Creation phase
