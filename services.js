@@ -66,9 +66,11 @@ export async function generateMarketingCopy(imageBuffer, mimeType, params) {
           💵 Price: RM [Price]
           [Call to Action: 1 short sentence creating urgency or inviting them over]
 
-          *CRITICAL LANGUAGE RULES FOR CAPTION:* 
+          *CRITICAL LANGUAGE RULES FOR CAPTION:*
           - If Output Language is "Local Style": Use heavy conversational Malaysian street slang/Manglish (e.g., 'Ngam ngam', 'Padu', 'Fuh', 'Memang layan') for the Hook and Call to Action.
           - If Output Language is "English": Write like a normal, everyday Malaysian speaking casual English. Keep it punchy and realistic.
+          - If Output Language is "Bahasa Melayu": Write in casual conversational Malay as a friendly local stall owner would speak — warm, direct, no formal civil-service register.
+          - If Output Language is "中文" or "Chinese": Write in casual Simplified Chinese as a friendly Malaysian Chinese vendor would speak — direct, appetizing, hawker-stall energy. Keep "RM" for price per CRITICAL RULE 1. Avoid Mainland-China-specific idioms; lean local/Malaysian-Chinese phrasing where natural.
 
         ${shouldGenerateBg ? `
         --- TASK 2: BACKGROUND GENERATION PROMPT ---
