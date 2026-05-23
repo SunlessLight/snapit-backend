@@ -4,9 +4,9 @@ const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const TIMEOUT_MS = 15000;
 
 const TIERS = [
-    { model: 'google/gemma-4-31b-it:free', label: 'gemma-4-31b' },
-    { model: 'nvidia/nemotron-nano-12b-v2-vl:free', label: 'nemotron-nano-vl' },
-    { model: 'google/gemini-2.5-flash', label: 'gemini-2.5-flash-paid' },
+    { model: 'google/gemma-4-26b-a4b-it', label: 'gemma-4-26b-a4b' },
+    { model: 'bytedance-seed/seed-1.6-flash', label: 'seed-1.6-flash' },
+    { model: 'google/gemini-2.5-flash', label: 'gemini-2.5-flash' },
 ];
 
 async function callOpenRouter(model, prompt, schema, imageBase64, mimeType) {
@@ -25,6 +25,7 @@ async function callOpenRouter(model, prompt, schema, imageBase64, mimeType) {
             },
             body: JSON.stringify({
                 model,
+                provider: { require_parameters: true },
                 messages: [{
                     role: 'user',
                     content: [

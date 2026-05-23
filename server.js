@@ -1,4 +1,10 @@
 import 'dotenv/config';
+
+if (!process.env.OPENROUTER_API_KEY) {
+    console.error('[boot] FATAL: OPENROUTER_API_KEY is not set. Did you start the server from snapit-backend/?');
+    process.exit(1);
+}
+
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
