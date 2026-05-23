@@ -1,0 +1,86 @@
+import logger from './logger.js';
+
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const TIMEOUT_MS = 15000;
+
+const TIERS = [
+    { model: 'google/gemma-4-31b-it:free', label: 'gemma-4-31b' },
+    { model: 'nvidia/nemotron-nano-12b-v2-vl:free', label: 'nemotron-nano-vl' },
+    { model: 'google/gemini-2.5-flash', label: 'gemini-2.5-flash-paid' },
+];
+
+async function callOpenRouter(model, prompt, schema, imageBase64, mimeType) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+    try {
+        const res = await fetch(OPENROUTER_URL, {
+            method: 'POST',
+            signal: controller.signal,
+            headers: {
+                'Authorization': `Bearer ${(process.env.OPENROUTER_API_KEY || '').trim()}`,
+                'Content-Type': 'application/json',
+                'HTTP-Referer': process.env.FRONTEND_URL || 'http://localhost:5173',
+                'X-Title': 'SnapIT',
+            },
+            body: JSON.stringify({
+                model,
+                messages: [{
+                    role: 'user',
+                    content: [
+                        { type: 'text', text: prompt },
+                        { type: 'image_url', image_url: { url: `data:${mimeType};base64,${imageBase64}` } },
+                    ],
+                }],
+                response_format: {
+                    type: 'json_schema',
+                    json_schema: { name: 'marketingCopy', strict: true, schema },
+                },
+            }),
+        });
+
+        if (!res.ok) {
+            const body = await res.text().catch(() => '');
+            const err = new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
+            err.status = res.status;
+            throw err;
+        }
+
+        const json = await res.json();
+        const content = json?.choices?.[0]?.message?.content;
+        if (!content) throw new Error('empty response content');
+
+        const cleaned = content.replace(/^```json\s*/i, '').replace(/\s*```$/i, '').trim();
+        return JSON.parse(cleaned);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+export async function generateWithCascade(prompt, schema, imageBase64, mimeType) {
+    const errors = [];
+
+    for (let i = 0; i < TIERS.length; i++) {
+        const { model, label } = TIERS[i];
+        const tierNum = i + 1;
+        const started = Date.now();
+
+        try {
+            const result = await callOpenRouter(model, prompt, schema, imageBase64, mimeType);
+            const latency = Date.now() - started;
+            logger.info({ tier: tierNum, model, latencyMs: latency }, 'llm.tier_ok');
+            return { ...result, provider: label };
+        } catch (err) {
+            const latency = Date.now() - started;
+            const reason = err.name === 'AbortError' ? `timeout after ${TIMEOUT_MS}ms` : err.message;
+            logger.warn({ tier: tierNum, model, latencyMs: latency, reason }, 'llm.tier_failed — falling through');
+            errors.push(`tier${tierNum}(${label}): ${reason}`);
+
+            if (err.status === 401) {
+                throw new Error(`OpenRouter auth failed (401) — check OPENROUTER_API_KEY. ${errors.join(' | ')}`);
+            }
+        }
+    }
+
+    throw new Error(`All ${TIERS.length} LLM tiers failed. ${errors.join(' | ')}`);
+}

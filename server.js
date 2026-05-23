@@ -3,16 +3,32 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import crypto from 'crypto';
+import pinoHttp from 'pino-http';
 import { generateMarketingCopy, processImageBackground } from './services.js';
+import logger from './logger.js';
 
 const app = express();
 const port = process.env.PORT || 3000;
 
 const corsOptions = {
-    origin: process.env.FRONTEND_URL || '*', // Update this to your Netlify URL in production
+    origin: process.env.FRONTEND_URL || '*',
     optionsSuccessStatus: 200
 };
 app.use(cors(corsOptions));
+app.use(pinoHttp({
+    logger,
+    customLogLevel: (req, res, err) => {
+        if (err || res.statusCode >= 500) return 'error';
+        if (res.statusCode >= 400) return 'warn';
+        return 'info';
+    },
+    customSuccessMessage: (req, res) => `${req.method} ${req.url} → ${res.statusCode}`,
+    customErrorMessage: (req, res, err) => `${req.method} ${req.url} → ${res.statusCode} (${err?.message || 'error'})`,
+    serializers: {
+        req: (req) => ({ method: req.method, url: req.url }),
+        res: (res) => ({ statusCode: res.statusCode }),
+    },
+}));
 app.use(express.json());
 
 const storage = multer.memoryStorage();
@@ -29,17 +45,23 @@ app.post('/api/generate', upload.single('image'), (req, res) => {
     // Extract text fields exactly as your old code did[cite: 1]
     const {
         dishName, price, outputLanguage, backgroundVibe, generateBackground,
-        isMediaEditorPro, isContextPro, description, tone
+        isMediaEditorPro, isContextPro, description, tone, backgroundDescription
     } = req.body;
     const shouldGenerateBg = generateBackground === "true";
     const isPro = isContextPro === 'true';
-    const requiredFields = shouldGenerateBg ? [dishName, price, outputLanguage, backgroundVibe] : [dishName, price, outputLanguage];
+    // In Pro mode the vibe pills are disabled in the UI — the vendor's free-form
+    // backgroundDescription is the required signal instead.
+    const requiredFields = shouldGenerateBg
+        ? (isPro
+            ? [dishName, price, outputLanguage, backgroundDescription]
+            : [dishName, price, outputLanguage, backgroundVibe])
+        : [dishName, price, outputLanguage];
 
 
     if (requiredFields.some(field => typeof field !== 'string' || field.trim() === '')) {
         return res.status(400).json({
             success: false,
-            error: `Missing required fields. Received: dishName(${dishName}), price(${price}), lang(${outputLanguage}), vibe(${backgroundVibe})`
+            error: `Missing required fields. Received: dishName(${dishName}), price(${price}), lang(${outputLanguage}), vibe(${backgroundVibe}), bgDescription(${backgroundDescription})`
         });
     }
 
@@ -51,7 +73,7 @@ app.post('/api/generate', upload.single('image'), (req, res) => {
     }
 
     if (isMediaEditorPro === 'true') {
-        console.log(`[/api/generate] Pro media editor enabled for dish: ${dishName}`);
+        logger.info({ dishName }, 'pro media editor enabled');
     }
 
     // 2. Job Creation phase
@@ -73,9 +95,12 @@ app.get('/api/status/:jobId', (req, res) => {
     res.status(200).json(job);
 });
 
-// The background worker
 async function processJob(jobId, file, body) {
     const abortController = new AbortController();
+    const jobLog = logger.child({ jobId, dish: body.dishName });
+    const started = Date.now();
+
+    jobLog.info({ shouldGenerateBg: body.generateBackground === 'true' }, 'job.start');
 
     try {
         const imageBuffer = file.buffer;
@@ -83,24 +108,22 @@ async function processJob(jobId, file, body) {
         const originalName = file.originalname;
         const shouldGenerateBg = body.generateBackground === 'true';
 
-        // Call your Gemini marketing copy service[cite: 1]
-        const copyResult = await generateMarketingCopy(
-            imageBuffer,
-            mimeType,
-            body
-        );
+        const copyStart = Date.now();
+        const copyResult = await generateMarketingCopy(imageBuffer, mimeType, body);
+        jobLog.info({ provider: copyResult.provider, ms: Date.now() - copyStart }, 'job.copy_done');
 
         let generatedImageBase64 = null;
         if (shouldGenerateBg) {
+            const bgStart = Date.now();
             generatedImageBase64 = await processImageBackground(
                 imageBuffer,
                 originalName,
                 copyResult.backgroundPrompt,
                 abortController.signal
             );
-        };
+            jobLog.info({ ms: Date.now() - bgStart }, 'job.bg_done');
+        }
 
-        // Save the successful payload identical to your old response structure[cite: 1]
         jobs.set(jobId, {
             status: 'completed',
             data: {
@@ -113,12 +136,12 @@ async function processJob(jobId, file, body) {
             error: null
         });
 
+        jobLog.info({ totalMs: Date.now() - started }, 'job.complete');
+
     } catch (error) {
         abortController.abort();
-        console.error(`[Job ${jobId}] Error:`, error);
 
         let errorMessage = "Internal server error";
-
         if (error instanceof SyntaxError) {
             errorMessage = "AI generation failed: Unable to parse JSON response.";
         } else if (error.code === 'ECONNABORTED' || error.response?.status === 504 || error.name === 'AbortError' || error.code === 'ERR_CANCELED') {
@@ -127,15 +150,13 @@ async function processJob(jobId, file, body) {
             errorMessage = error.response?.data?.message || error.message || errorMessage;
         }
 
+        jobLog.error({ err: error, totalMs: Date.now() - started }, `job.failed: ${errorMessage}`);
         jobs.set(jobId, { status: 'failed', data: null, error: errorMessage });
     }
 
-    // Inside processJob, after completion or failure:
-    setTimeout(() => {
-        jobs.delete(jobId);
-    }, 600000); // 10 minutes
+    setTimeout(() => { jobs.delete(jobId); }, 600000);
 }
 
 app.listen(port, () => {
-    console.log(`✓ SnapIT backend listening on port ${port}`);
+    logger.info({ port }, 'SnapIT backend listening');
 });

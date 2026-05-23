@@ -1,16 +1,17 @@
-import { GoogleGenAI, Type } from '@google/genai';
 import axios from 'axios';
 import FormData from 'form-data';
-
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+import { generateWithCascade } from './llmCascade.js';
 
 export async function generateMarketingCopy(imageBuffer, mimeType, params) {
     const {
         dishName, price, outputLanguage, backgroundVibe, generateBackground,
-        isContextPro, description, tone
+        isContextPro, description, tone, backgroundDescription
     } = params;
     const shouldGenerateBg = generateBackground === 'true';
     const isPro = isContextPro === 'true';
+    const hasProBgDescription = isPro && shouldGenerateBg
+        && typeof backgroundDescription === 'string'
+        && backgroundDescription.trim() !== '';
 
     const proBlock = isPro ? `
         PRO CONTEXT — VENDOR-PROVIDED:
@@ -23,19 +24,26 @@ export async function generateMarketingCopy(imageBuffer, mimeType, params) {
     let backgroundVibeString = "";
 
     if (shouldGenerateBg) {
-        switch (backgroundVibe) {
-            case 'kopitiam':
-                backgroundVibeString = "Classic Malaysian Kopitiam. White marble table surface with slight imperfections. Harsh, bright fluorescent overhead lighting. Authentic, traditional local feel.";
-                break;
-            case 'cafe':
-                backgroundVibeString = "Modern, bright aesthetic cafe. Light oak wood table surface. Soft, warm natural sunlight streaming from a window. Clean, inviting, and highly appetizing.";
-                break;
-            case 'street':
-                backgroundVibeString = "Night market or street food vibe. Dark, textured asphalt or stainless steel cart surface. Warm, glowing bokeh from neon signs or street lamps in the background. High contrast, energetic.";
-                break;
-            case 'premium':
-                backgroundVibeString = "High-end modern restaurant. Smooth, dark walnut wood or clean slate surface. Soft, elegant, diffused studio lighting. Minimalist, uncluttered, and highly professional.";
-                break;
+        if (hasProBgDescription) {
+            // Pro vendors describe the background themselves; the pill switch is
+            // ignored in this branch. Gemini polishes this verbatim into a final
+            // backgroundPrompt (see TASK 2 below).
+            backgroundVibeString = backgroundDescription.trim();
+        } else {
+            switch (backgroundVibe) {
+                case 'kopitiam':
+                    backgroundVibeString = "Classic Malaysian Kopitiam. White marble table surface with slight imperfections. Harsh, bright fluorescent overhead lighting. Authentic, traditional local feel.";
+                    break;
+                case 'cafe':
+                    backgroundVibeString = "Modern, bright aesthetic cafe. Light oak wood table surface. Soft, warm natural sunlight streaming from a window. Clean, inviting, and highly appetizing.";
+                    break;
+                case 'street':
+                    backgroundVibeString = "Night market or street food vibe. Dark, textured asphalt or stainless steel cart surface. Warm, glowing bokeh from neon signs or street lamps in the background. High contrast, energetic.";
+                    break;
+                case 'premium':
+                    backgroundVibeString = "High-end modern restaurant. Smooth, dark walnut wood or clean slate surface. Soft, elegant, diffused studio lighting. Minimalist, uncluttered, and highly professional.";
+                    break;
+            }
         }
     }
 
@@ -79,7 +87,10 @@ export async function generateMarketingCopy(imageBuffer, mimeType, params) {
         - Or is it an Angled/Profile shot showing depth?
 
         Write the 'backgroundPrompt' based on the perspective and the Background Vibe ("${backgroundVibeString}").
-        
+        ${hasProBgDescription ? `
+        IMPORTANT — VENDOR-PROVIDED BACKGROUND:
+        The Background Vibe above came verbatim from the vendor. Use it as the primary creative direction. Polish it into a professional food-photography prompt by adding lighting, surface texture, and depth-of-field details that stay faithful to their intent. Do not invent contradictory elements (e.g., do not change "marble" to "wood"). If the vendor's text is sparse, expand with food-photography fundamentals; if it is detailed, preserve its specifics.
+        ` : ''}
         CRITICAL RULES FOR BACKGROUND PROMPT:
         1. DO NOT describe the food itself. The food is already cut out.
         2. IF TOP-DOWN: Describe ONLY a flat surface texture directly beneath the food. Do NOT mention a background, room, or depth of field.
@@ -90,39 +101,19 @@ export async function generateMarketingCopy(imageBuffer, mimeType, params) {
         `}
     `;
 
-    const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: [
-            { text: prompt },
-            {
-                inlineData: {
-                    data: imageBuffer.toString("base64"),
-                    mimeType: mimeType
-                }
-            }
-        ],
-        config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                    title: { type: Type.STRING },
-                    description: { type: Type.STRING },
-                    caption: { type: Type.STRING },
-                    backgroundPrompt: { type: Type.STRING }
-                },
-                required: ["title", "description", "caption", "backgroundPrompt"]
-            }
-        }
-    });
+    const schema = {
+        type: "object",
+        properties: {
+            title: { type: "string" },
+            description: { type: "string" },
+            caption: { type: "string" },
+            backgroundPrompt: { type: "string" }
+        },
+        required: ["title", "description", "caption", "backgroundPrompt"],
+        additionalProperties: false
+    };
 
-    if (!response || !response.text) {
-        throw new Error("AI generation blocked by safety settings or returned an empty response.");
-    }
-
-    const cleanText = response.text.replace(/^```json\s*/i, '').replace(/\s*```$/i, '').trim();
-    return JSON.parse(cleanText);
-
+    return await generateWithCascade(prompt, schema, imageBuffer.toString("base64"), mimeType);
 };
 
 export async function processImageBackground(imageBuffer, originalName, backgroundPrompt, abortSignal) {
