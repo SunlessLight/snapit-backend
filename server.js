@@ -51,7 +51,7 @@ app.post('/api/generate', upload.single('image'), (req, res) => {
     // Extract text fields exactly as your old code did[cite: 1]
     const {
         dishName, price, outputLanguage, backgroundVibe, generateBackground,
-        isMediaEditorPro, isContextPro, description, tone, backgroundDescription
+        isMediaEditorPro, isContextPro, description, tone, captionLength, backgroundDescription
     } = req.body;
     const shouldGenerateBg = generateBackground === "true";
     const isPro = isContextPro === 'true';
@@ -71,11 +71,26 @@ app.post('/api/generate', upload.single('image'), (req, res) => {
         });
     }
 
-    if (isPro && (typeof description !== 'string' || description.trim() === '' || typeof tone !== 'string' || tone.trim() === '')) {
+    // Pro requires the free-form vendor description. Tone/length are picker-only and
+    // always have a Standard default — they're validated via enum below, not non-empty.
+    if (isPro && (typeof description !== 'string' || description.trim() === '')) {
         return res.status(400).json({
             success: false,
-            error: `Pro context enabled but missing required fields. Received: description("${description}"), tone("${tone}")`
+            error: `Pro context enabled but description is empty. Received: description("${description}")`
         });
+    }
+
+    // Enum validation with defensive defaults. Standard mode always sends "casual" /
+    // "short"; Pro sends user selection. Old clients (pre-redesign) may send the
+    // legacy `tone` enum (funny/luxury/etc) or no `captionLength` at all — we
+    // accept those by falling back to the Standard defaults rather than 400-ing.
+    const ALLOWED_TONES = new Set(['casual', 'punchy', 'polished', 'playful']);
+    const ALLOWED_LENGTHS = new Set(['short', 'medium', 'long']);
+    if (typeof tone !== 'string' || !ALLOWED_TONES.has(tone)) {
+        req.body.tone = 'casual';
+    }
+    if (typeof captionLength !== 'string' || !ALLOWED_LENGTHS.has(captionLength)) {
+        req.body.captionLength = 'short';
     }
 
     if (isMediaEditorPro === 'true') {
