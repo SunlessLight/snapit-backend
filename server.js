@@ -10,7 +10,8 @@ import cors from 'cors';
 import multer from 'multer';
 import crypto from 'crypto';
 import pinoHttp from 'pino-http';
-import { generateMarketingCopy, processImageBackground } from './services.js';
+import { generateMarketingCopy, processImageBackground, enhanceImageWithClaid } from './services.js';
+import requireToken from './middleware/requireToken.js';
 import logger from './logger.js';
 
 const app = express();
@@ -106,6 +107,28 @@ app.post('/api/generate', upload.single('image'), (req, res) => {
 
     // 4. Asynchronous Processing (Do not await)
     processJob(jobId, req.file, req.body);
+});
+
+app.post('/api/enhance', requireToken, upload.single('image'), async (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ success: false, error: 'Image file is required.' });
+    }
+
+    const abortController = new AbortController();
+    const started = Date.now();
+    const enhanceLog = logger.child({ route: 'enhance', size: req.file.size, mime: req.file.mimetype });
+    enhanceLog.info('enhance.start');
+
+    try {
+        const enhancedBuffer = await enhanceImageWithClaid(req.file.buffer, req.file.mimetype, abortController.signal);
+        enhanceLog.info({ ms: Date.now() - started, outBytes: enhancedBuffer.length }, 'enhance.done');
+        res.set('Content-Type', 'image/jpeg').send(enhancedBuffer);
+    } catch (error) {
+        abortController.abort();
+        const errorMessage = error.response?.data?.toString?.() || error.message || 'Enhance failed';
+        enhanceLog.error({ err: error, ms: Date.now() - started }, `enhance.failed: ${errorMessage}`);
+        res.status(502).json({ success: false, error: errorMessage });
+    }
 });
 
 app.get('/api/status/:jobId', (req, res) => {

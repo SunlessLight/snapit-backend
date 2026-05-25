@@ -168,6 +168,57 @@ export async function generateMarketingCopy(imageBuffer, mimeType, params) {
     return await generateWithCascade(prompt, schema, imageBuffer.toString("base64"), mimeType);
 };
 
+// Food-tuned Claid operations. Values are conservative-but-noticeable defaults — meant
+// to be tuned during Phase 6 verification on real low-light kopitiam, bright cafe, and
+// messy-plate shots. Decompress fixes JPEG block artefacts; HDR pulls shadow detail
+// out; sharpening + saturation are small bumps so we don't over-AI the result.
+const CLAID_FOOD_OPERATIONS = {
+    restorations: {
+        decompress: 'auto',
+    },
+    adjustments: {
+        hdr: { intensity: 60 },
+        sharpness: 25,
+        saturation: 15,
+    },
+};
+
+export async function enhanceImageWithClaid(imageBuffer, mimeType, abortSignal) {
+    if (!process.env.CLAID_API_KEY) {
+        throw new Error('CLAID_API_KEY is not set');
+    }
+
+    const formData = new FormData();
+    formData.append('file', imageBuffer, { filename: `upload.${mimeType.split('/')[1] || 'jpg'}`, contentType: mimeType });
+    formData.append('data', JSON.stringify({ operations: CLAID_FOOD_OPERATIONS }));
+
+    // Step 1: upload + process. /v1/image/edit/upload returns JSON with a tmp_url —
+    // NOT the binary. The /v1-ext/... path does not exist (returns 404).
+    const uploadResponse = await axios.post('https://api.claid.ai/v1/image/edit/upload', formData, {
+        headers: {
+            ...formData.getHeaders(),
+            'Authorization': `Bearer ${process.env.CLAID_API_KEY}`,
+        },
+        timeout: 15000,
+        signal: abortSignal,
+    });
+
+    const tmpUrl = uploadResponse?.data?.data?.output?.tmp_url;
+    if (!tmpUrl) {
+        throw new Error('Claid response missing data.output.tmp_url');
+    }
+
+    // Step 2: fetch the processed image binary from the temporal URL. No auth header
+    // here — tmp_url is pre-signed.
+    const imageResponse = await axios.get(tmpUrl, {
+        responseType: 'arraybuffer',
+        timeout: 15000,
+        signal: abortSignal,
+    });
+
+    return Buffer.from(imageResponse.data, 'binary');
+}
+
 export async function processImageBackground(imageBuffer, originalName, backgroundPrompt, abortSignal) {
     const formData = new FormData();
     formData.append('imageFile', imageBuffer, { filename: originalName || 'upload.png' }); //[cite: 2]
