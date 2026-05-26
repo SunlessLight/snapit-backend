@@ -168,18 +168,21 @@ export async function generateMarketingCopy(imageBuffer, mimeType, params) {
     return await generateWithCascade(prompt, schema, imageBuffer.toString("base64"), mimeType);
 };
 
-// Food-tuned Claid operations. Values are conservative-but-noticeable defaults — meant
-// to be tuned during Phase 6 verification on real low-light kopitiam, bright cafe, and
-// messy-plate shots. Decompress fixes JPEG block artefacts; HDR pulls shadow detail
-// out; sharpening + saturation are small bumps so we don't over-AI the result.
+// A single operation chain to get general enhancing in all areas of picture taken
 const CLAID_FOOD_OPERATIONS = {
-    restorations: {
-        decompress: 'auto',
+    "restorations": {
+        "decompress": 'auto',
+        "upscale": 'smart_enhance',
+        "polish": true
     },
-    adjustments: {
-        hdr: { intensity: 60 },
-        sharpness: 25,
-        saturation: 15,
+    "resizing": {
+        "width": "150%",
+        "height": "150%",
+    },
+    "adjustments": {
+        "hdr": { "intensity": 60 },
+        "sharpness": 25,
+        "saturation": 15,
     },
 };
 
@@ -199,7 +202,7 @@ export async function enhanceImageWithClaid(imageBuffer, mimeType, abortSignal) 
             ...formData.getHeaders(),
             'Authorization': `Bearer ${process.env.CLAID_API_KEY}`,
         },
-        timeout: 15000,
+        timeout: 20000,
         signal: abortSignal,
     });
 
