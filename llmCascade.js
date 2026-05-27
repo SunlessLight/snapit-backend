@@ -13,6 +13,13 @@ async function callOpenRouter(model, prompt, schema, imageBase64, mimeType) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
+    // Text-only calls (e.g. bg-prompt refinement) skip the image part so we
+    // don't pay encoding cost or force vision routing for a pure text task.
+    const content = [{ type: 'text', text: prompt }];
+    if (imageBase64 && mimeType) {
+        content.push({ type: 'image_url', image_url: { url: `data:${mimeType};base64,${imageBase64}` } });
+    }
+
     try {
         const res = await fetch(OPENROUTER_URL, {
             method: 'POST',
@@ -26,13 +33,7 @@ async function callOpenRouter(model, prompt, schema, imageBase64, mimeType) {
             body: JSON.stringify({
                 model,
                 provider: { require_parameters: true },
-                messages: [{
-                    role: 'user',
-                    content: [
-                        { type: 'text', text: prompt },
-                        { type: 'image_url', image_url: { url: `data:${mimeType};base64,${imageBase64}` } },
-                    ],
-                }],
+                messages: [{ role: 'user', content }],
                 response_format: {
                     type: 'json_schema',
                     json_schema: { name: 'marketingCopy', strict: true, schema },

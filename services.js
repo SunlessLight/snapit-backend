@@ -168,6 +168,126 @@ export async function generateMarketingCopy(imageBuffer, mimeType, params) {
     return await generateWithCascade(prompt, schema, imageBuffer.toString("base64"), mimeType);
 };
 
+// Assistive-mode caption refinement. Takes the vendor's edited draft + a free-form
+// change request and returns a refined (title, description, caption). Tone/length/
+// language are reused from the original call so the refined draft stays coherent.
+// Schema is narrower than generateMarketingCopy — backgroundPrompt is regenerated
+// separately via refineBackgroundPrompt to keep the two assistive levers independent.
+export async function refineMarketingCopy(imageBuffer, mimeType, params, currentDraft, changePrompt) {
+    const {
+        dishName, price, outputLanguage,
+        isContextPro, description, tone, captionLength
+    } = params;
+    const isPro = isContextPro === 'true';
+    const toneKey = TONE_KEYS.has(tone) ? tone : 'casual';
+    const lengthKey = LENGTH_KEYS.has(captionLength) ? captionLength : 'short';
+    const languageKey = LANGUAGE_KEYS.has(outputLanguage)
+        ? outputLanguage
+        : (outputLanguage === 'Chinese' ? '中文' : 'English');
+
+    const proBlock = isPro && typeof description === 'string' && description.trim() !== '' ? `
+        PRO CONTEXT — VENDOR-PROVIDED:
+        Vendor's Own Description: "${description}"
+
+        Weave any factual ingredient/origin/process details from the vendor's description into the description and caption naturally — do not quote it verbatim and do not invent details the vendor did not state. The TONE and LENGTH rules above still govern voice and word count.
+    ` : '';
+
+    const trimmedChange = (changePrompt || '').trim();
+    const changeBlock = trimmedChange === ''
+        ? `The vendor did not provide specific guidance — produce a different take on the same dish that varies word choice, sentence structure, and angle while staying faithful to the dish, language, tone, and length.`
+        : `The vendor wants this change applied: "${trimmedChange}". Apply it across whichever of the three fields the change touches. Leave the other fields alone unless the change makes them inconsistent.`;
+
+    const prompt = `
+        You are an expert Malaysian social media copywriter for food vendors. The vendor already has a working draft (below) and wants to refine it. Your job is to produce a single refined version of the title, description, and caption based on their change request.
+
+        Context:
+        Dish Name: ${dishName}
+        Price: ${price}
+        Output Language: ${languageKey}
+        ${proBlock}
+
+        UNIVERSAL RULES (apply to title, description, and caption):
+        1. CURRENCY: Always use "RM" (e.g., RM 13.50). Never use "$".
+        2. CONTRACTIONS: Use them naturally ("we're", "it's", "that's").
+        3. NO ADJECTIVE STACKING: One adjective per noun, max.
+        4. VARY SENTENCE OPENINGS.
+        5. NO GENERIC ENGAGEMENT FILLER ("Let us know in the comments!", "Drop a 🔥 below", etc).
+        6. BANNED WORDS — never use any of: "Indulge", "Exquisite", "Harmonious", "Whimsical", "Delightful", "Elevate", "Symphony", "Serene", "Savour", "Aromatic", "Companion", "Experience", "Viral", "Journey", "Realm", "Transformative", "Masterpiece", "Adventure", "Culinary", "Palate".
+
+        TONE — non-negotiable for the caption:
+        ${TONE_RULES[toneKey]}
+
+        LENGTH — non-negotiable for the caption body:
+        ${LENGTH_RULES[lengthKey]}
+
+        HASHTAG STRATEGY (always append to caption):
+        Append 5-7 hashtags at the very end of the caption on a new line after a blank line. Mix ~40% local/micro-local (#klfood, #pjeats), ~30% category-specific (#nasilemak, #mamak), ~20% broad discovery (#malaysianfood), ~10% brand/niche. Do not exceed 7 hashtags.
+
+        OUTPUT LANGUAGE — write the title, description, AND caption in this ONE language style only:
+        ${LANGUAGE_RULES[languageKey]}
+
+        --- CURRENT DRAFT (vendor's working baseline) ---
+        title: "${currentDraft.title || ''}"
+        description: "${currentDraft.description || ''}"
+        caption: "${currentDraft.caption || ''}"
+
+        --- REFINEMENT INSTRUCTION ---
+        ${changeBlock}
+
+        Return the refined title, description, and caption. Title stays 3-5 words. Description stays 1-2 factual sentences. Caption stays under the TONE and LENGTH rules above and ends with the hashtag block.
+    `;
+
+    const schema = {
+        type: "object",
+        properties: {
+            title: { type: "string" },
+            description: { type: "string" },
+            caption: { type: "string" }
+        },
+        required: ["title", "description", "caption"],
+        additionalProperties: false
+    };
+
+    return await generateWithCascade(prompt, schema, imageBuffer.toString("base64"), mimeType);
+}
+
+// Assistive-mode background-prompt refinement. Text-only LLM call (no image) —
+// the original prompt already encodes the food's camera perspective from the
+// first generation. Merges the original prompt with the vendor's change request
+// into a single coherent bg-swap prompt that processImageBackground can consume.
+export async function refineBackgroundPrompt(originalBackgroundPrompt, changePrompt) {
+    const trimmedChange = (changePrompt || '').trim();
+    const changeBlock = trimmedChange === ''
+        ? `The vendor did not provide specific guidance — produce a variant of the original prompt with different lighting, surface texture, or depth-of-field details. Stay in the same overall aesthetic family.`
+        : `The vendor wants this change: "${trimmedChange}". Incorporate it naturally without contradicting the original prompt's structure.`;
+
+    const prompt = `
+        You are a food-photography prompt engineer. The vendor has a background prompt for a background-swap API and wants to refine it. Produce ONE new background prompt that merges the original with the change request.
+
+        Original background prompt:
+        "${originalBackgroundPrompt || ''}"
+
+        ${changeBlock}
+
+        CRITICAL RULES:
+        1. DO NOT describe the food itself — the food is already cut out.
+        2. Preserve the original prompt's camera-perspective intent (flatlay surface only, or angled with depth-of-field background).
+        3. Keep surface, lighting, and mood details concrete — avoid vague adjectives.
+        4. Return ONE single coherent prompt as the backgroundPrompt field. Do not return alternatives or commentary.
+    `;
+
+    const schema = {
+        type: "object",
+        properties: {
+            backgroundPrompt: { type: "string" }
+        },
+        required: ["backgroundPrompt"],
+        additionalProperties: false
+    };
+
+    return await generateWithCascade(prompt, schema);
+}
+
 // A single operation chain to get general enhancing in all areas of picture taken
 const CLAID_FOOD_OPERATIONS = {
     "restorations": {

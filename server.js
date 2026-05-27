@@ -10,7 +10,7 @@ import cors from 'cors';
 import multer from 'multer';
 import crypto from 'crypto';
 import pinoHttp from 'pino-http';
-import { generateMarketingCopy, processImageBackground, enhanceImageWithClaid } from './services.js';
+import { generateMarketingCopy, processImageBackground, enhanceImageWithClaid, refineMarketingCopy, refineBackgroundPrompt } from './services.js';
 import requireToken from './middleware/requireToken.js';
 import logger from './logger.js';
 
@@ -128,6 +128,91 @@ app.post('/api/enhance', requireToken, upload.single('image'), async (req, res) 
         const errorMessage = error.response?.data?.toString?.() || error.message || 'Enhance failed';
         enhanceLog.error({ err: error, ms: Date.now() - started }, `enhance.failed: ${errorMessage}`);
         res.status(502).json({ success: false, error: errorMessage });
+    }
+});
+
+// Assistive-mode caption regen. Sync — user is sitting on the Review screen.
+// Re-sends image instead of relying on the jobs Map so the loop's lifetime is
+// not coupled to the 10-min TTL.
+app.post('/api/regenerate/captions', upload.single('image'), async (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ success: false, error: 'Image file is required.' });
+    }
+    const {
+        dishName, price, outputLanguage, tone, captionLength,
+        isContextPro, description,
+        currentTitle, currentDescription, currentCaption, changePrompt
+    } = req.body;
+
+    if (!dishName || !price || !outputLanguage) {
+        return res.status(400).json({ success: false, error: 'dishName, price, outputLanguage are required.' });
+    }
+
+    const started = Date.now();
+    const log = logger.child({ route: 'regenerate.captions', dish: dishName });
+    log.info('regen.captions.start');
+
+    try {
+        const result = await refineMarketingCopy(
+            req.file.buffer,
+            req.file.mimetype,
+            { dishName, price, outputLanguage, isContextPro, description, tone, captionLength },
+            { title: currentTitle, description: currentDescription, caption: currentCaption },
+            changePrompt
+        );
+        log.info({ ms: Date.now() - started, provider: result.provider }, 'regen.captions.done');
+        res.status(200).json({
+            success: true,
+            title: result.title,
+            description: result.description,
+            caption: result.caption
+        });
+    } catch (error) {
+        log.error({ err: error, ms: Date.now() - started }, `regen.captions.failed: ${error.message}`);
+        res.status(502).json({ success: false, error: error.message || 'Caption regen failed' });
+    }
+});
+
+// Assistive-mode background regen. Always runs on the ORIGINAL food image
+// (frontend sends mediaState.originalFile, not the previously bg-swapped output)
+// so artifacts don't compound across iterations.
+app.post('/api/regenerate/background', upload.single('image'), async (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ success: false, error: 'Image file is required.' });
+    }
+    const { originalBackgroundPrompt, changePrompt } = req.body;
+    if (!originalBackgroundPrompt) {
+        return res.status(400).json({ success: false, error: 'originalBackgroundPrompt is required.' });
+    }
+
+    const abortController = new AbortController();
+    const started = Date.now();
+    const log = logger.child({ route: 'regenerate.background' });
+    log.info('regen.bg.start');
+
+    try {
+        const refined = await refineBackgroundPrompt(originalBackgroundPrompt, changePrompt);
+        const refinePromptMs = Date.now() - started;
+        log.info({ ms: refinePromptMs }, 'regen.bg.prompt_merged');
+
+        const bgStart = Date.now();
+        const generatedImageBase64 = await processImageBackground(
+            req.file.buffer,
+            req.file.originalname,
+            refined.backgroundPrompt,
+            abortController.signal
+        );
+        log.info({ ms: Date.now() - bgStart, totalMs: Date.now() - started }, 'regen.bg.done');
+
+        res.status(200).json({
+            success: true,
+            generatedImageBase64,
+            backgroundPrompt: refined.backgroundPrompt
+        });
+    } catch (error) {
+        abortController.abort();
+        log.error({ err: error, ms: Date.now() - started }, `regen.bg.failed: ${error.message}`);
+        res.status(502).json({ success: false, error: error.message || 'Background regen failed' });
     }
 });
 
