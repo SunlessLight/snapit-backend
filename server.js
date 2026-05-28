@@ -9,10 +9,35 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import pinoHttp from 'pino-http';
-import { generateMarketingCopy, processImageBackground, enhanceImageWithClaid, refineMarketingCopy, refineBackgroundPrompt } from './services.js';
+import { generateMarketingCopy, processImageBackground, enhanceImageWithClaid, refineMarketingCopy, refineBackgroundPrompt, previewSegmentation } from './services.js';
 import requireToken from './middleware/requireToken.js';
 import logger from './logger.js';
+
+// Phase 6.7.3 — scene reference cache. Loaded once on boot, kept in memory.
+// Same pattern Phase 7A's watermark will use. Missing files are not an error;
+// the cache simply omits that vibe and processJob falls through to text-only
+// background generation. See snapit-backend/assets/scenes/README.md for the
+// Owner-action checklist of what files need to land here.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const SCENE_VIBES = ['kopitiam', 'cafe', 'street', 'premium'];
+const SCENE_CACHE = new Map();
+for (const vibe of SCENE_VIBES) {
+    const filePath = path.join(__dirname, 'assets', 'scenes', `${vibe}.jpg`);
+    try {
+        const buf = fs.readFileSync(filePath);
+        SCENE_CACHE.set(vibe, { buffer: buf, filename: `${vibe}.jpg` });
+    } catch {
+        // File missing — text-only fallback. No log noise until first use.
+    }
+}
+logger.info(
+    { loaded: [...SCENE_CACHE.keys()], expected: SCENE_VIBES },
+    'scene_cache.boot'
+);
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -180,14 +205,22 @@ app.post('/api/regenerate/background', upload.single('image'), async (req, res) 
     if (!req.file) {
         return res.status(400).json({ success: false, error: 'Image file is required.' });
     }
-    const { originalBackgroundPrompt, changePrompt } = req.body;
+    const { originalBackgroundPrompt, changePrompt, seedMode, lastSeed } = req.body;
     if (!originalBackgroundPrompt) {
         return res.status(400).json({ success: false, error: 'originalBackgroundPrompt is required.' });
     }
 
+    // Phase 6.7.4 — seedMode controls whether we replay last call's seed
+    // ("Tweak this one" — same composition, prompt-driven nudge) or pick a
+    // fresh random uint32 ("New variation"). Invalid lastSeed silently falls
+    // back to vary so a missing/stale value doesn't 400 the regen.
+    const parsedLastSeed = lastSeed !== undefined ? parseInt(lastSeed, 10) : NaN;
+    const shouldFixSeed = seedMode === 'fix' && Number.isInteger(parsedLastSeed) && parsedLastSeed >= 0;
+    const seedOption = shouldFixSeed ? { seed: parsedLastSeed } : undefined;
+
     const abortController = new AbortController();
     const started = Date.now();
-    const log = logger.child({ route: 'regenerate.background' });
+    const log = logger.child({ route: 'regenerate.background', seedMode: shouldFixSeed ? 'fix' : 'vary' });
     log.info('regen.bg.start');
 
     try {
@@ -196,23 +229,60 @@ app.post('/api/regenerate/background', upload.single('image'), async (req, res) 
         log.info({ ms: refinePromptMs }, 'regen.bg.prompt_merged');
 
         const bgStart = Date.now();
-        const generatedImageBase64 = await processImageBackground(
+        const bgResult = await processImageBackground(
             req.file.buffer,
             req.file.originalname,
             refined.backgroundPrompt,
-            abortController.signal
+            abortController.signal,
+            seedOption
         );
-        log.info({ ms: Date.now() - bgStart, totalMs: Date.now() - started }, 'regen.bg.done');
+        log.info(
+            {
+                ms: Date.now() - bgStart,
+                totalMs: Date.now() - started,
+                uncertaintyScore: bgResult.uncertaintyScore,
+                seed: bgResult.seed,
+            },
+            'regen.bg.done'
+        );
 
         res.status(200).json({
             success: true,
-            generatedImageBase64,
-            backgroundPrompt: refined.backgroundPrompt
+            generatedImageBase64: bgResult.imageBase64,
+            backgroundPrompt: refined.backgroundPrompt,
+            bgUncertaintyScore: bgResult.uncertaintyScore,
+            bgSeed: bgResult.seed
         });
     } catch (error) {
         abortController.abort();
         log.error({ err: error, ms: Date.now() - started }, `regen.bg.failed: ${error.message}`);
         res.status(502).json({ success: false, error: error.message || 'Background regen failed' });
+    }
+});
+
+// Phase 6.7.5 — pre-generation mask preview. Sync (~2-4s) — user is waiting
+// on the MaskPreview screen. Returns a PNG cutout (subject on transparent
+// background) so the user can decide "looks right" → continue to /api/generate,
+// or "retake" → back to Upload without spending a /v2/edit credit.
+app.post('/api/segmentation-preview', upload.single('image'), async (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ success: false, error: 'Image file is required.' });
+    }
+
+    const abortController = new AbortController();
+    const started = Date.now();
+    const log = logger.child({ route: 'segmentation-preview', size: req.file.size, mime: req.file.mimetype });
+    log.info('segment.start');
+
+    try {
+        const cutoutBuffer = await previewSegmentation(req.file.buffer, req.file.originalname, abortController.signal);
+        log.info({ ms: Date.now() - started, outBytes: cutoutBuffer.length }, 'segment.done');
+        res.set('Content-Type', 'image/png').send(cutoutBuffer);
+    } catch (error) {
+        abortController.abort();
+        const errorMessage = error.response?.data?.toString?.() || error.message || 'Segment failed';
+        log.error({ err: error, ms: Date.now() - started }, `segment.failed: ${errorMessage}`);
+        res.status(502).json({ success: false, error: errorMessage });
     }
 });
 
@@ -242,15 +312,39 @@ async function processJob(jobId, file, body) {
         jobLog.info({ provider: copyResult.provider, ms: Date.now() - copyStart }, 'job.copy_done');
 
         let generatedImageBase64 = null;
+        let bgUncertaintyScore = null;
+        let bgSeed = null;
         if (shouldGenerateBg) {
             const bgStart = Date.now();
-            generatedImageBase64 = await processImageBackground(
+            // Standard mode: send a style-reference image if we have one
+            // cached for the selected vibe. Pro mode stays text-only (the
+            // vendor's free-form description is the signal there). Missing
+            // cache entries are silent fallback — see SCENE_CACHE init.
+            const isPro = body.isContextPro === 'true';
+            const sceneAsset = !isPro && body.backgroundVibe
+                ? SCENE_CACHE.get(body.backgroundVibe)
+                : null;
+            const bgResult = await processImageBackground(
                 imageBuffer,
                 originalName,
                 copyResult.backgroundPrompt,
-                abortController.signal
+                abortController.signal,
+                sceneAsset
+                    ? { guidanceImageBuffer: sceneAsset.buffer, guidanceFilename: sceneAsset.filename }
+                    : undefined
             );
-            jobLog.info({ ms: Date.now() - bgStart }, 'job.bg_done');
+            generatedImageBase64 = bgResult.imageBase64;
+            bgUncertaintyScore = bgResult.uncertaintyScore;
+            bgSeed = bgResult.seed;
+            jobLog.info(
+                {
+                    ms: Date.now() - bgStart,
+                    uncertaintyScore: bgUncertaintyScore,
+                    seed: bgSeed,
+                    guidance: sceneAsset ? body.backgroundVibe : null,
+                },
+                'job.bg_done'
+            );
         }
 
         jobs.set(jobId, {
@@ -260,7 +354,9 @@ async function processJob(jobId, file, body) {
                 description: copyResult.description,
                 caption: copyResult.caption,
                 backgroundPrompt: copyResult.backgroundPrompt,
-                generatedImageBase64: generatedImageBase64
+                generatedImageBase64: generatedImageBase64,
+                bgUncertaintyScore,
+                bgSeed
             },
             error: null
         });

@@ -342,23 +342,88 @@ export async function enhanceImageWithClaid(imageBuffer, mimeType, abortSignal) 
     return Buffer.from(imageResponse.data, 'binary');
 }
 
-export async function processImageBackground(imageBuffer, originalName, backgroundPrompt, abortSignal) {
+export async function processImageBackground(imageBuffer, originalName, backgroundPrompt, abortSignal, options = {}) {
+    const { guidanceImageBuffer, guidanceFilename, seed } = options;
+
+    // Phase 6.7.4 — deterministic-seed support. We always pick a seed locally
+    // (random uint32 when caller didn't supply one) rather than relying on
+    // Photoroom to echo one back, so the response shape is consistent and
+    // "fix this variant" can replay the exact integer next call.
+    const seedToUse = Number.isInteger(seed) && seed >= 0
+        ? seed
+        : Math.floor(Math.random() * 0xFFFFFFFF);
+
     const formData = new FormData();
-    formData.append('imageFile', imageBuffer, { filename: originalName || 'upload.png' }); //[cite: 2]
-    formData.append('background.prompt', backgroundPrompt); //[cite: 2]
-    formData.append('referenceBox', 'originalImage'); //[cite: 2]
-    formData.append('background.expandPrompt.mode', 'ai.never'); //[cite: 2]
+    formData.append('imageFile', imageBuffer, { filename: originalName || 'upload.png' });
+    formData.append('background.prompt', backgroundPrompt);
+    formData.append('referenceBox', 'originalImage');
+    formData.append('background.expandPrompt.mode', 'ai.never');
+    formData.append('background.seed', String(seedToUse));
+    // Hardcoded singular constant — Photoroom docs require singular form
+    // ("the food dish", not "food dishes"). Baking it in prevents accidental
+    // plural from upstream callers and gives the segmenter a clear hint on
+    // cluttered photos. Not user input, not LLM-generated.
+    formData.append('segmentation.prompt', 'the food dish');
+
+    // Phase 6.7.3 — optional style-reference image. Photoroom uses this for
+    // surface, lighting, palette, and mood; composition is still driven by
+    // the food photo's own perspective. scale=0.6 is Photoroom's documented
+    // default — controls how strongly the reference influences output.
+    if (guidanceImageBuffer) {
+        formData.append('background.guidance.imageFile', guidanceImageBuffer, {
+            filename: guidanceFilename || 'guidance.jpg',
+        });
+        formData.append('background.guidance.scale', '0.6');
+    }
 
     const response = await axios.post(process.env.IMAGE_PROCESSING_API_URL, formData, {
         headers: {
-            'Content-Type': `multipart/form-data; boundary=${formData.getBoundary()}`, //[cite: 2]
-            'x-api-key': `${process.env.IMAGE_PROCESSING_API_KEY}`, //[cite: 2]
-            'pr-ai-background-model-version': `background-studio-beta-2025-03-17`, //[cite: 2]
+            'Content-Type': `multipart/form-data; boundary=${formData.getBoundary()}`,
+            'x-api-key': `${process.env.IMAGE_PROCESSING_API_KEY}`,
+            'pr-ai-background-model-version': `background-studio-beta-2025-03-17`,
         },
-        responseType: 'arraybuffer', //[cite: 2]
-        timeout: 15000, //[cite: 2]
-        signal: abortSignal //[cite: 2]
+        responseType: 'arraybuffer',
+        timeout: 15000,
+        signal: abortSignal
     });
 
-    return Buffer.from(response.data, 'binary').toString('base64'); //[cite: 2]
+    // x-uncertainty-score: 0=confident, 1=unsure, -1=humans detected.
+    // Header may be omitted on some responses — parseFloat('') yields NaN, so
+    // we coerce missing/non-numeric values to null. Downstream callers branch
+    // on null vs. number rather than guessing what a missing header means.
+    const rawScore = response.headers['x-uncertainty-score'];
+    const parsedScore = rawScore !== undefined ? parseFloat(rawScore) : NaN;
+    const uncertaintyScore = Number.isFinite(parsedScore) ? parsedScore : null;
+
+    return {
+        imageBase64: Buffer.from(response.data, 'binary').toString('base64'),
+        uncertaintyScore,
+        seed: seedToUse,
+    };
+}
+
+// Phase 6.7.5 — pre-generation cutout preview. Calls Photoroom's cheaper
+// /v1/segment endpoint (sdk.photoroom.com, not image-api.photoroom.com — they
+// live on different bases) which returns just the subject on transparent
+// background. The point is to give the user a "looks right / retake" gate
+// BEFORE the expensive /v2/edit call, saving the credit on bad photos.
+// Same hardcoded singular prompt as the main pipeline.
+const PHOTOROOM_SEGMENT_API_URL = 'https://sdk.photoroom.com/v1/segment';
+
+export async function previewSegmentation(imageBuffer, originalName, abortSignal) {
+    const formData = new FormData();
+    formData.append('image_file', imageBuffer, { filename: originalName || 'upload.png' });
+    formData.append('segmentation.prompt', 'the food dish');
+
+    const response = await axios.post(PHOTOROOM_SEGMENT_API_URL, formData, {
+        headers: {
+            'Content-Type': `multipart/form-data; boundary=${formData.getBoundary()}`,
+            'x-api-key': `${process.env.IMAGE_PROCESSING_API_KEY}`,
+        },
+        responseType: 'arraybuffer',
+        timeout: 15000,
+        signal: abortSignal,
+    });
+
+    return Buffer.from(response.data, 'binary');
 }
