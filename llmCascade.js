@@ -49,10 +49,10 @@ async function callOpenRouter(model, prompt, schema, imageBase64, mimeType) {
         }
 
         const json = await res.json();
-        const content = json?.choices?.[0]?.message?.content;
-        if (!content) throw new Error('empty response content');
+        const messageContent = json?.choices?.[0]?.message?.content;
+        if (!messageContent) throw new Error('empty response content');
 
-        const cleaned = content.replace(/^```json\s*/i, '').replace(/\s*```$/i, '').trim();
+        const cleaned = messageContent.replace(/^```json\s*/i, '').replace(/\s*```$/i, '').trim();
         return JSON.parse(cleaned);
     } finally {
         clearTimeout(timer);
