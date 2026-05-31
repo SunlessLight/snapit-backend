@@ -12,8 +12,6 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@supabase/ssr": "^0.10.3",
-    "@supabase/supabase-js": "^2.106.0",
     "axios": "^1.16.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",

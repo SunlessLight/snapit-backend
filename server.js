@@ -42,8 +42,19 @@ logger.info(
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Job map TTL. Jobs are deleted JOB_TTL_MS after they complete (success or
+// failure). The frontend polls /api/status; a 404 from that endpoint is the
+// terminal signal that the job has aged out.
+const JOB_TTL_MS = 10 * 60 * 1000;
+// Multer upload cap. 5MB comfortably covers HEIC-converted JPEGs from modern
+// phones after the frontend's browser-image-compression pass.
+const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+
+if (!process.env.FRONTEND_URL) {
+    logger.warn('[boot] FRONTEND_URL is not set — CORS will reject all browser origins. Set it in .env (e.g. http://localhost:5173 for dev).');
+}
 const corsOptions = {
-    origin: process.env.FRONTEND_URL || '*',
+    origin: process.env.FRONTEND_URL,
     optionsSuccessStatus: 200
 };
 app.use(cors(corsOptions));
@@ -64,7 +75,7 @@ app.use(pinoHttp({
 app.use(express.json());
 
 const storage = multer.memoryStorage();
-const upload = multer({ storage: storage, limits: { fileSize: 5 * 1024 * 1024 } });
+const upload = multer({ storage: storage, limits: { fileSize: MAX_UPLOAD_BYTES } });
 
 const jobs = new Map();
 
@@ -165,8 +176,8 @@ app.post('/api/regenerate/captions', upload.single('image'), async (req, res) =>
     }
     const {
         dishName, price, outputLanguage, tone, captionLength,
-        isContextPro, description,
-        currentTitle, currentDescription, currentCaption, changePrompt
+        isContextPro, description, platform, location, hours, contact,
+        currentCaption, currentNoteTitle, changePrompt
     } = req.body;
 
     if (!dishName || !price || !outputLanguage) {
@@ -174,23 +185,23 @@ app.post('/api/regenerate/captions', upload.single('image'), async (req, res) =>
     }
 
     const started = Date.now();
-    const log = logger.child({ route: 'regenerate.captions', dish: dishName });
+    const log = logger.child({ route: 'regenerate.captions', dish: dishName, platform });
     log.info('regen.captions.start');
 
     try {
         const result = await refineMarketingCopy(
             req.file.buffer,
             req.file.mimetype,
-            { dishName, price, outputLanguage, isContextPro, description, tone, captionLength },
-            { title: currentTitle, description: currentDescription, caption: currentCaption },
+            { dishName, price, outputLanguage, isContextPro, description, tone, captionLength, platform, location, hours, contact },
+            { caption: currentCaption, noteTitle: currentNoteTitle },
             changePrompt
         );
         log.info({ ms: Date.now() - started, provider: result.provider }, 'regen.captions.done');
         res.status(200).json({
             success: true,
-            title: result.title,
-            description: result.description,
-            caption: result.caption
+            caption: result.caption,
+            // Present only when platform === 'xiaohongshu'
+            noteTitle: result.noteTitle,
         });
     } catch (error) {
         log.error({ err: error, ms: Date.now() - started }, `regen.captions.failed: ${error.message}`);
@@ -240,7 +251,6 @@ app.post('/api/regenerate/background', upload.single('image'), async (req, res) 
             {
                 ms: Date.now() - bgStart,
                 totalMs: Date.now() - started,
-                uncertaintyScore: bgResult.uncertaintyScore,
                 seed: bgResult.seed,
             },
             'regen.bg.done'
@@ -250,7 +260,6 @@ app.post('/api/regenerate/background', upload.single('image'), async (req, res) 
             success: true,
             generatedImageBase64: bgResult.imageBase64,
             backgroundPrompt: refined.backgroundPrompt,
-            bgUncertaintyScore: bgResult.uncertaintyScore,
             bgSeed: bgResult.seed
         });
     } catch (error) {
@@ -312,7 +321,6 @@ async function processJob(jobId, file, body) {
         jobLog.info({ provider: copyResult.provider, ms: Date.now() - copyStart }, 'job.copy_done');
 
         let generatedImageBase64 = null;
-        let bgUncertaintyScore = null;
         let bgSeed = null;
         if (shouldGenerateBg) {
             const bgStart = Date.now();
@@ -334,12 +342,10 @@ async function processJob(jobId, file, body) {
                     : undefined
             );
             generatedImageBase64 = bgResult.imageBase64;
-            bgUncertaintyScore = bgResult.uncertaintyScore;
             bgSeed = bgResult.seed;
             jobLog.info(
                 {
                     ms: Date.now() - bgStart,
-                    uncertaintyScore: bgUncertaintyScore,
                     seed: bgSeed,
                     guidance: sceneAsset ? body.backgroundVibe : null,
                 },
@@ -352,10 +358,11 @@ async function processJob(jobId, file, body) {
             data: {
                 title: copyResult.title,
                 description: copyResult.description,
-                caption: copyResult.caption,
+                // Phase: per-platform captions. Array of { platform, body, noteTitle? }
+                // ordered by the vendor's platform selection.
+                captions: copyResult.captions,
                 backgroundPrompt: copyResult.backgroundPrompt,
                 generatedImageBase64: generatedImageBase64,
-                bgUncertaintyScore,
                 bgSeed
             },
             error: null
@@ -379,7 +386,7 @@ async function processJob(jobId, file, body) {
         jobs.set(jobId, { status: 'failed', data: null, error: errorMessage });
     }
 
-    setTimeout(() => { jobs.delete(jobId); }, 600000);
+    setTimeout(() => { jobs.delete(jobId); }, JOB_TTL_MS);
 }
 
 app.listen(port, () => {

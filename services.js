@@ -29,15 +29,78 @@ const LANGUAGE_RULES = {
     'Local Style': `Heavy Malaysian street slang / Manglish (e.g. 'Ngam ngam', 'Padu', 'Fuh', 'Memang layan', 'Syiok gila', 'Don't play play'). The TONE rules still apply on top — e.g. a punchy Local Style caption is still terse fragments, just in Manglish.`,
 };
 
+// Per-platform structure rules. Same philosophy as TONE_RULES: concrete,
+// marker-based instructions (where the hook sits, how many hashtags, emoji
+// density, what the CTA points at) so the model produces output that reads as
+// native to each platform instead of one generic "social caption". Hashtag
+// policy lives INSIDE each block — it's platform-specific, not universal.
+// Delivery is deliberately not a caption: it overrides TONE/LENGTH and omits
+// hashtags/emoji/CTA/business-info entirely (the delivery app shows those).
+const PLATFORM_RULES = {
+    instagram: `INSTAGRAM — write for the feed. The FIRST line is a standalone hook that must work before the "...more" fold (Instagram hides everything after ~1-2 lines) — do NOT put an emoji in that first line. Follow with 1-2 lines of value, then exactly ONE specific call-to-action ("Come try it this weekend", "Save this for your next makan trip") — never stack multiple asks. 2-3 emojis in the body only. End with a blank line, then 5-7 hashtags mixing ~40% local/micro-local (use the vendor's location when given, e.g. #bangsareats #klfood), ~30% the actual dish/cuisine (#nasilemak #charkueyteow), ~20% broad (#malaysianfood #foodmalaysia), ~10% niche (#halal #homemade). No #foodie #yum #instafood filler.`,
+    facebook: `FACEBOOK — write like a post in a local makan group, not an ad. Warm, conversational, community voice; Bahasa Rojak welcome. Slightly longer and chattier than Instagram is fine. The call-to-action points to a real next step the vendor can act on — WhatsApp/message to order, call, or drop by (use the vendor's contact and hours when given). Use 0-2 hashtags at most, or none — Facebook is not a hashtag-discovery platform and heavy tags read as spam here. Light emoji only.`,
+    xiaohongshu: `XIAOHONGSHU (小红书/RED) — write a 种草 ("grass-planting") recommendation note, not an ad. Produce TWO parts: (1) a short scroll-stopping NOTE TITLE (≤20 characters, 1-2 emojis) for the xiaohongshu_title field — curiosity or a bold tasty claim, e.g. "🤤这家叻沙汤头绝了"; (2) the BODY: short lines separated by line breaks, each key line starting with an emoji (✨ 📍 💰 🍜 style), sprinkled with searchable keywords a hungry user would type (dish name, area, 平价, 必点). Keep it diary-like and personal, not corporate. End with 3-5 RED-style #tags (dish + area + vibe). Heavier emoji use than Instagram is expected and on-brand here.`,
+    delivery: `DELIVERY MENU (GrabFood / Foodpanda) — this is NOT a social caption. Write a single appetising menu-item description of 1-2 factual sentences: what's in it, the key textures/tastes, what makes it worth ordering. NO hashtags. NO emoji. NO call-to-action and NO location/hours/contact (the delivery app already shows those). Ignore the TONE and LENGTH presets — menu copy is its own register. Descriptive but honest, e.g. "Crispy fried chicken thigh over fragrant coconut rice, with house sambal and a runny-yolk egg."`,
+};
+
+// Maps each platform to its output field. Xiaohongshu carries a second field
+// (the note title) because RED notes have a distinct clickable title separate
+// from the body.
+const PLATFORM_FIELD = {
+    instagram: { field: 'caption_instagram', label: 'Instagram caption' },
+    facebook: { field: 'caption_facebook', label: 'Facebook post' },
+    xiaohongshu: { field: 'caption_xiaohongshu', label: 'Xiaohongshu note body' },
+    delivery: { field: 'caption_delivery', label: 'Delivery menu description' },
+};
+
 const TONE_KEYS = new Set(Object.keys(TONE_RULES));
 const LENGTH_KEYS = new Set(Object.keys(LENGTH_RULES));
 const LANGUAGE_KEYS = new Set(Object.keys(LANGUAGE_RULES));
+const PLATFORM_KEYS = new Set(Object.keys(PLATFORM_RULES));
+
+// Parse the multipart `platforms` field (CSV or array) into a validated,
+// de-duped, order-preserving list. Falls back to ['instagram'] so a missing or
+// all-invalid value never produces an empty caption set.
+function parsePlatforms(raw) {
+    const list = Array.isArray(raw)
+        ? raw
+        : (typeof raw === 'string' ? raw.split(',') : []);
+    const seen = new Set();
+    const out = [];
+    for (const item of list) {
+        const key = String(item).trim();
+        if (PLATFORM_KEYS.has(key) && !seen.has(key)) {
+            seen.add(key);
+            out.push(key);
+        }
+    }
+    return out.length ? out : ['instagram'];
+}
+
+// Build the optional STALL INFO prompt block from vendor business fields.
+// Empty fields are simply absent (no "Location: " artifacts). The delivery
+// field is told to ignore this — see PLATFORM_RULES.delivery.
+function buildStallBlock({ location, hours, contact }) {
+    const parts = [];
+    if (typeof location === 'string' && location.trim()) parts.push(`Location: ${location.trim()}`);
+    if (typeof hours === 'string' && hours.trim()) parts.push(`Operating hours: ${hours.trim()}`);
+    if (typeof contact === 'string' && contact.trim()) parts.push(`Contact: ${contact.trim()}`);
+    if (!parts.length) return '';
+    return `
+        STALL INFO — VENDOR-PROVIDED:
+        ${parts.join('\n        ')}
+
+        Weave these naturally into the social captions where they help the reader act (Instagram's CTA, Facebook's "WhatsApp to order / drop by"). Do NOT invent any of these details, and do NOT include them in the delivery menu field.
+    `;
+}
 
 export async function generateMarketingCopy(imageBuffer, mimeType, params) {
     const {
         dishName, price, outputLanguage, backgroundVibe, generateBackground,
-        isContextPro, description, tone, captionLength, backgroundDescription
+        isContextPro, description, tone, captionLength, backgroundDescription,
+        platforms, location, hours, contact
     } = params;
+    const selectedPlatforms = parsePlatforms(platforms);
     const shouldGenerateBg = generateBackground === 'true';
     const isPro = isContextPro === 'true';
     const hasProBgDescription = isPro && shouldGenerateBg
@@ -61,6 +124,23 @@ export async function generateMarketingCopy(imageBuffer, mimeType, params) {
 
         Weave any factual ingredient/origin/process details from the vendor's description into the description and caption naturally — do not quote it verbatim and do not invent details the vendor did not state. The TONE and LENGTH rules above still govern voice and word count.
     ` : '';
+
+    const stallBlock = buildStallBlock({ location, hours, contact });
+
+    // One labelled rule block per selected platform, plus the per-platform
+    // output-field instructions. Built dynamically so the prompt only carries
+    // the platforms the vendor actually picked.
+    const platformRulesSection = selectedPlatforms
+        .map((p) => `- ${PLATFORM_RULES[p]}`)
+        .join('\n\n        ');
+    const platformFieldInstructions = selectedPlatforms
+        .map((p) => {
+            if (p === 'xiaohongshu') {
+                return `- ${PLATFORM_FIELD[p].field}: the Xiaohongshu note BODY (line-broken, emoji-led) per the XIAOHONGSHU rule above.\n        - xiaohongshu_title: the short RED note title (≤20 chars, 1-2 emojis) per the XIAOHONGSHU rule above.`;
+            }
+            return `- ${PLATFORM_FIELD[p].field}: ${PLATFORM_FIELD[p].label} written under the ${p.toUpperCase()} rule above.`;
+        })
+        .join('\n        ');
 
     let backgroundVibeString = "";
 
@@ -97,9 +177,10 @@ export async function generateMarketingCopy(imageBuffer, mimeType, params) {
         Output Language: ${languageKey}
         Background Vibe: ${backgroundVibeString}
         ${proBlock}
-        --- TASK 1: COPYWRITING (Title, Description, Caption) ---
+        ${stallBlock}
+        --- TASK 1: COPYWRITING (Title, Description, and one caption per platform) ---
 
-        UNIVERSAL RULES (apply to title, description, and caption):
+        UNIVERSAL RULES (apply to title, description, and every caption):
         1. CURRENCY: Always use "RM" (e.g., RM 13.50). Never use "$".
         2. CONTRACTIONS: Use them naturally ("we're", "it's", "that's"). Spelled-out forms ("we are", "it is") read as AI-generated.
         3. NO ADJECTIVE STACKING: Do NOT write strings like "fresh, vibrant, delicious, aromatic". One adjective per noun, max.
@@ -107,30 +188,26 @@ export async function generateMarketingCopy(imageBuffer, mimeType, params) {
         5. NO GENERIC ENGAGEMENT FILLER: Do not write "Let us know in the comments!", "What are your thoughts?", "Drop a 🔥 below", or similar canned prompts.
         6. BANNED WORDS — never use any of: "Indulge", "Exquisite", "Harmonious", "Whimsical", "Delightful", "Elevate", "Symphony", "Serene", "Savour", "Aromatic", "Companion", "Experience", "Viral", "Journey", "Realm", "Transformative", "Masterpiece", "Adventure", "Culinary", "Palate", "Flavor adventure", "Elevate your palate", "Culinary masterpiece".
 
-        TONE — this is non-negotiable for the caption:
+        TONE — governs the voice of every social caption (Instagram, Facebook, Xiaohongshu):
         ${TONE_RULES[toneKey]}
 
-        LENGTH — this is non-negotiable for the caption body:
+        LENGTH — a guide for Instagram and Facebook caption bodies. Each PLATFORM rule below takes precedence where it conflicts; Xiaohongshu and the Delivery menu set their own length and ignore this:
         ${LENGTH_RULES[lengthKey]}
 
-        HASHTAG STRATEGY (always append to caption):
-        Append 5-7 hashtags at the very end of the caption, on a new line after a blank line. Mix roughly:
-        - ~40% local/micro-local: city or neighbourhood + food (#klfood, #pjeats, #penangfood, #subangeats, #bangsareats)
-        - ~30% category-specific: the actual dish or cuisine (#nasilemak, #charkwayteow, #mamak, #kopitiam, #tehtarik)
-        - ~20% broad discovery: #malaysianfood, #foodmalaysia, #malaysiafoodie
-        - ~10% brand/niche: #homemade, #halal, #traditional, #streetfood (pick what actually fits the dish)
-        Do not use more than 7 hashtags. Do not pad with generic #foodie #yum #instafood — Instagram 2025 ranks relevance over volume.
+        PLATFORM RULES — each selected platform has its own structure, hashtag policy, emoji density, and call-to-action. Write each platform's caption to ITS rule; do not blur the voices together or reuse the same text across platforms:
+        ${platformRulesSection}
 
-        OUTPUT LANGUAGE — write the title, description, AND caption in this ONE language style only. Do NOT produce multiple language variants. Do NOT include the words "title:", "description:", or "caption:" inside any field's text — those are field names, not content.
+        OUTPUT LANGUAGE — write the title, description, AND every caption in this ONE language style only. Do NOT produce multiple language variants of a field. Do NOT include field names like "title:" or "caption:" inside any field's text.
 
         ${LANGUAGE_RULES[languageKey]}
 
-        The title and description follow the same language but stay slightly more readable than the caption.
+        The title and description follow the same language but stay slightly more readable than the captions.
 
         Provide the text for these specific fields:
         - title: A short, punchy, realistic name for the dish (max 3-5 words). Keep it simple ("Crispy Fish Noodle Soup", NOT "Exquisite Fish Noodle Symphony"). Title is exempt from the TONE/LENGTH rules.
         - description: A 1-2 sentence factual menu description. Taste, texture, ingredients. No emotional fluff. Exempt from TONE/LENGTH rules but still bound by UNIVERSAL RULES.
-        - caption: A scroll-stopping Instagram caption written under the TONE and LENGTH rules above, followed by the hashtag block per HASHTAG STRATEGY. Mention the price somewhere natural — do not force it into a fixed line position.
+        ${platformFieldInstructions}
+        Mention the price somewhere natural in each social caption — do not force it into a fixed line position.
 
         ${shouldGenerateBg ? `
         --- TASK 2: BACKGROUND GENERATION PROMPT ---
@@ -153,30 +230,60 @@ export async function generateMarketingCopy(imageBuffer, mimeType, params) {
         `}
     `;
 
-    const schema = {
-        type: "object",
-        properties: {
-            title: { type: "string" },
-            description: { type: "string" },
-            caption: { type: "string" },
-            backgroundPrompt: { type: "string" }
-        },
-        required: ["title", "description", "caption", "backgroundPrompt"],
-        additionalProperties: false
+    // Dynamic schema — one required caption field per selected platform (RED
+    // adds its note-title field). Built per-request rather than fixed so the
+    // model is only asked for the platforms the vendor picked. Strict per-field
+    // schema (not an open-ended list) keeps small models from stacking variants.
+    const properties = {
+        title: { type: "string" },
+        description: { type: "string" },
     };
+    const required = ["title", "description"];
+    for (const p of selectedPlatforms) {
+        properties[PLATFORM_FIELD[p].field] = { type: "string" };
+        required.push(PLATFORM_FIELD[p].field);
+        if (p === 'xiaohongshu') {
+            properties.xiaohongshu_title = { type: "string" };
+            required.push('xiaohongshu_title');
+        }
+    }
+    properties.backgroundPrompt = { type: "string" };
+    required.push("backgroundPrompt");
 
-    return await generateWithCascade(prompt, schema, imageBuffer.toString("base64"), mimeType);
+    const schema = { type: "object", properties, required, additionalProperties: false };
+
+    const result = await generateWithCascade(prompt, schema, imageBuffer.toString("base64"), mimeType);
+
+    // Re-shape the flat LLM fields into an ordered captions array the frontend
+    // can map over. Keeps the strict-schema flatness on the wire while giving
+    // the UI a clean per-platform structure.
+    const captions = selectedPlatforms.map((p) => {
+        const entry = { platform: p, body: result[PLATFORM_FIELD[p].field] || '' };
+        if (p === 'xiaohongshu') entry.noteTitle = result.xiaohongshu_title || '';
+        return entry;
+    });
+
+    return {
+        title: result.title,
+        description: result.description,
+        captions,
+        backgroundPrompt: result.backgroundPrompt,
+        provider: result.provider,
+    };
 };
 
-// Assistive-mode caption refinement. Takes the vendor's edited draft + a free-form
-// change request and returns a refined (title, description, caption). Tone/length/
-// language are reused from the original call so the refined draft stays coherent.
-// Schema is narrower than generateMarketingCopy — backgroundPrompt is regenerated
-// separately via refineBackgroundPrompt to keep the two assistive levers independent.
+// Assistive-mode caption refinement. Refines ONE platform's caption (the
+// platform the vendor is regenerating on Review). Title/description are shared
+// across platforms, so they're left untouched here — only the targeted
+// caption (and, for Xiaohongshu, its note title) is returned. Tone/length/
+// language/platform are reused from the original call so the refined draft
+// stays coherent. backgroundPrompt is regenerated separately via
+// refineBackgroundPrompt to keep the two assistive levers independent.
 export async function refineMarketingCopy(imageBuffer, mimeType, params, currentDraft, changePrompt) {
     const {
         dishName, price, outputLanguage,
-        isContextPro, description, tone, captionLength
+        isContextPro, description, tone, captionLength,
+        platform, location, hours, contact
     } = params;
     const isPro = isContextPro === 'true';
     const toneKey = TONE_KEYS.has(tone) ? tone : 'casual';
@@ -184,29 +291,34 @@ export async function refineMarketingCopy(imageBuffer, mimeType, params, current
     const languageKey = LANGUAGE_KEYS.has(outputLanguage)
         ? outputLanguage
         : (outputLanguage === 'Chinese' ? '中文' : 'English');
+    const platformKey = PLATFORM_KEYS.has(platform) ? platform : 'instagram';
+    const isRed = platformKey === 'xiaohongshu';
 
     const proBlock = isPro && typeof description === 'string' && description.trim() !== '' ? `
         PRO CONTEXT — VENDOR-PROVIDED:
         Vendor's Own Description: "${description}"
 
-        Weave any factual ingredient/origin/process details from the vendor's description into the description and caption naturally — do not quote it verbatim and do not invent details the vendor did not state. The TONE and LENGTH rules above still govern voice and word count.
+        Weave any factual ingredient/origin/process details from the vendor's description into the caption naturally — do not quote it verbatim and do not invent details the vendor did not state.
     ` : '';
+
+    const stallBlock = buildStallBlock({ location, hours, contact });
 
     const trimmedChange = (changePrompt || '').trim();
     const changeBlock = trimmedChange === ''
-        ? `The vendor did not provide specific guidance — produce a different take on the same dish that varies word choice, sentence structure, and angle while staying faithful to the dish, language, tone, and length.`
-        : `The vendor wants this change applied: "${trimmedChange}". Apply it across whichever of the three fields the change touches. Leave the other fields alone unless the change makes them inconsistent.`;
+        ? `The vendor did not provide specific guidance — produce a different take on the same caption that varies word choice, sentence structure, and angle while staying faithful to the dish, language, tone, and the platform rule above.`
+        : `The vendor wants this change applied: "${trimmedChange}". Apply it to the caption while keeping it faithful to the platform rule above.`;
 
     const prompt = `
-        You are an expert Malaysian social media copywriter for food vendors. The vendor already has a working draft (below) and wants to refine it. Your job is to produce a single refined version of the title, description, and caption based on their change request.
+        You are an expert Malaysian social media copywriter for food vendors. The vendor has a working caption (below) for ${platformKey.toUpperCase()} and wants to refine it. Produce a single refined caption for this platform only.
 
         Context:
         Dish Name: ${dishName}
         Price: ${price}
         Output Language: ${languageKey}
         ${proBlock}
+        ${stallBlock}
 
-        UNIVERSAL RULES (apply to title, description, and caption):
+        UNIVERSAL RULES:
         1. CURRENCY: Always use "RM" (e.g., RM 13.50). Never use "$".
         2. CONTRACTIONS: Use them naturally ("we're", "it's", "that's").
         3. NO ADJECTIVE STACKING: One adjective per noun, max.
@@ -214,39 +326,34 @@ export async function refineMarketingCopy(imageBuffer, mimeType, params, current
         5. NO GENERIC ENGAGEMENT FILLER ("Let us know in the comments!", "Drop a 🔥 below", etc).
         6. BANNED WORDS — never use any of: "Indulge", "Exquisite", "Harmonious", "Whimsical", "Delightful", "Elevate", "Symphony", "Serene", "Savour", "Aromatic", "Companion", "Experience", "Viral", "Journey", "Realm", "Transformative", "Masterpiece", "Adventure", "Culinary", "Palate".
 
-        TONE — non-negotiable for the caption:
+        TONE — governs the caption voice (ignored for the delivery menu):
         ${TONE_RULES[toneKey]}
 
-        LENGTH — non-negotiable for the caption body:
+        LENGTH — a guide for Instagram/Facebook; the PLATFORM rule below takes precedence where it conflicts:
         ${LENGTH_RULES[lengthKey]}
 
-        HASHTAG STRATEGY (always append to caption):
-        Append 5-7 hashtags at the very end of the caption on a new line after a blank line. Mix ~40% local/micro-local (#klfood, #pjeats), ~30% category-specific (#nasilemak, #mamak), ~20% broad discovery (#malaysianfood), ~10% brand/niche. Do not exceed 7 hashtags.
+        PLATFORM RULE — the caption must follow this exactly:
+        ${PLATFORM_RULES[platformKey]}
 
-        OUTPUT LANGUAGE — write the title, description, AND caption in this ONE language style only:
+        OUTPUT LANGUAGE — write the caption in this ONE language style only:
         ${LANGUAGE_RULES[languageKey]}
 
-        --- CURRENT DRAFT (vendor's working baseline) ---
-        title: "${currentDraft.title || ''}"
-        description: "${currentDraft.description || ''}"
-        caption: "${currentDraft.caption || ''}"
+        --- CURRENT CAPTION (vendor's working baseline) ---
+        ${isRed ? `note title: "${currentDraft.noteTitle || ''}"\n        ` : ''}caption: "${currentDraft.caption || ''}"
 
         --- REFINEMENT INSTRUCTION ---
         ${changeBlock}
 
-        Return the refined title, description, and caption. Title stays 3-5 words. Description stays 1-2 factual sentences. Caption stays under the TONE and LENGTH rules above and ends with the hashtag block.
+        Return the refined caption${isRed ? ' and note title' : ''} for ${platformKey.toUpperCase()} only.
     `;
 
-    const schema = {
-        type: "object",
-        properties: {
-            title: { type: "string" },
-            description: { type: "string" },
-            caption: { type: "string" }
-        },
-        required: ["title", "description", "caption"],
-        additionalProperties: false
-    };
+    const properties = { caption: { type: "string" } };
+    const required = ["caption"];
+    if (isRed) {
+        properties.noteTitle = { type: "string" };
+        required.push("noteTitle");
+    }
+    const schema = { type: "object", properties, required, additionalProperties: false };
 
     return await generateWithCascade(prompt, schema, imageBuffer.toString("base64"), mimeType);
 }
@@ -322,7 +429,7 @@ export async function enhanceImageWithClaid(imageBuffer, mimeType, abortSignal) 
             ...formData.getHeaders(),
             'Authorization': `Bearer ${process.env.CLAID_API_KEY}`,
         },
-        timeout: 20000,
+        timeout: 30000,
         signal: abortSignal,
     });
 
@@ -342,6 +449,14 @@ export async function enhanceImageWithClaid(imageBuffer, mimeType, abortSignal) 
     return Buffer.from(imageResponse.data, 'binary');
 }
 
+// Photoroom segmentation mode. keepSalientObject cuts out whatever the model
+// deems the main subject — a dish, a held drink (hand + arm kept), or an
+// intentionally-included person — rather than a prompt-pinned "food dish".
+// We let the user judge the cutout in the mask preview instead of trying to
+// classify every case server-side. Shared between /v2/edit (main pipeline) and
+// /v1/segment (mask preview) so the preview faithfully predicts the generate.
+const SEGMENTATION_MODE = 'keepSalientObject';
+
 export async function processImageBackground(imageBuffer, originalName, backgroundPrompt, abortSignal, options = {}) {
     const { guidanceImageBuffer, guidanceFilename, seed } = options;
 
@@ -359,11 +474,7 @@ export async function processImageBackground(imageBuffer, originalName, backgrou
     formData.append('referenceBox', 'originalImage');
     formData.append('background.expandPrompt.mode', 'ai.never');
     formData.append('background.seed', String(seedToUse));
-    // Hardcoded singular constant — Photoroom docs require singular form
-    // ("the food dish", not "food dishes"). Baking it in prevents accidental
-    // plural from upstream callers and gives the segmenter a clear hint on
-    // cluttered photos. Not user input, not LLM-generated.
-    formData.append('segmentation.prompt', 'the food dish');
+    formData.append('segmentation.mode', SEGMENTATION_MODE);
 
     // Phase 6.7.3 — optional style-reference image. Photoroom uses this for
     // surface, lighting, palette, and mood; composition is still driven by
@@ -387,17 +498,8 @@ export async function processImageBackground(imageBuffer, originalName, backgrou
         signal: abortSignal
     });
 
-    // x-uncertainty-score: 0=confident, 1=unsure, -1=humans detected.
-    // Header may be omitted on some responses — parseFloat('') yields NaN, so
-    // we coerce missing/non-numeric values to null. Downstream callers branch
-    // on null vs. number rather than guessing what a missing header means.
-    const rawScore = response.headers['x-uncertainty-score'];
-    const parsedScore = rawScore !== undefined ? parseFloat(rawScore) : NaN;
-    const uncertaintyScore = Number.isFinite(parsedScore) ? parsedScore : null;
-
     return {
         imageBase64: Buffer.from(response.data, 'binary').toString('base64'),
-        uncertaintyScore,
         seed: seedToUse,
     };
 }
@@ -407,13 +509,12 @@ export async function processImageBackground(imageBuffer, originalName, backgrou
 // live on different bases) which returns just the subject on transparent
 // background. The point is to give the user a "looks right / retake" gate
 // BEFORE the expensive /v2/edit call, saving the credit on bad photos.
-// Same hardcoded singular prompt as the main pipeline.
 const PHOTOROOM_SEGMENT_API_URL = 'https://sdk.photoroom.com/v1/segment';
 
 export async function previewSegmentation(imageBuffer, originalName, abortSignal) {
     const formData = new FormData();
     formData.append('image_file', imageBuffer, { filename: originalName || 'upload.png' });
-    formData.append('segmentation.prompt', 'the food dish');
+    formData.append('segmentation.mode', SEGMENTATION_MODE);
 
     const response = await axios.post(PHOTOROOM_SEGMENT_API_URL, formData, {
         headers: {
