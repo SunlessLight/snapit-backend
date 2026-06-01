@@ -449,13 +449,20 @@ export async function enhanceImageWithClaid(imageBuffer, mimeType, abortSignal) 
     return Buffer.from(imageResponse.data, 'binary');
 }
 
-// Photoroom segmentation mode. keepSalientObject cuts out whatever the model
-// deems the main subject — a dish, a held drink (hand + arm kept), or an
-// intentionally-included person — rather than a prompt-pinned "food dish".
-// We let the user judge the cutout in the mask preview instead of trying to
-// classify every case server-side. Shared between /v2/edit (main pipeline) and
-// /v1/segment (mask preview) so the preview faithfully predicts the generate.
-const SEGMENTATION_MODE = 'keepSalientObject';
+// Segmentation strategy: send NO segmentation params and rely on Photoroom's
+// DEFAULT segmentation, which keeps the image's salient object — exactly the
+// goal of cutting out "whatever the model deems the main subject" (dish, held
+// drink with hand+arm, or an intentional person) without pinning a "food dish"
+// prompt. The vendor still judges the result in the mask preview.
+//
+// Why not segmentation.mode=keepSalientObject: per Photoroom's docs that mode is
+// an ADD-ON to text-guided segmentation — it keeps the salient object "in
+// addition to the prompt" — so /v2/edit rejects it when no segmentation.prompt
+// is supplied ("missing segmentation prompt"). The default segmentation already
+// keeps "what the default segmentation would have kept" (the salient object), so
+// keepSalientObject is redundant for us and only useful alongside a prompt.
+// Both /v2/edit (main pipeline) and /v1/segment (mask preview) use the default,
+// so the preview faithfully predicts the generate.
 
 export async function processImageBackground(imageBuffer, originalName, backgroundPrompt, abortSignal, options = {}) {
     const { guidanceImageBuffer, guidanceFilename, seed } = options;
@@ -468,13 +475,22 @@ export async function processImageBackground(imageBuffer, originalName, backgrou
         ? seed
         : Math.floor(Math.random() * 0xFFFFFFFF);
 
+    // Photoroom 400s on an empty background.prompt. The LLM is told to return
+    // "N/A" when bg generation is off, but defensively guard here too so a blank
+    // or sentinel prompt fails loudly with a clear message instead of an opaque
+    // 400 from the image API.
+    const prompt = (backgroundPrompt || '').trim();
+    if (!prompt || prompt.toUpperCase() === 'N/A') {
+        throw new Error('Background prompt is empty — the copy model did not return a usable backgroundPrompt.');
+    }
+
     const formData = new FormData();
     formData.append('imageFile', imageBuffer, { filename: originalName || 'upload.png' });
-    formData.append('background.prompt', backgroundPrompt);
+    formData.append('background.prompt', prompt);
     formData.append('referenceBox', 'originalImage');
     formData.append('background.expandPrompt.mode', 'ai.never');
     formData.append('background.seed', String(seedToUse));
-    formData.append('segmentation.mode', SEGMENTATION_MODE);
+    // No segmentation.* params — default segmentation keeps the salient subject.
 
     // Phase 6.7.3 — optional style-reference image. Photoroom uses this for
     // surface, lighting, palette, and mood; composition is still driven by
@@ -487,21 +503,55 @@ export async function processImageBackground(imageBuffer, originalName, backgrou
         formData.append('background.guidance.scale', '0.6');
     }
 
-    const response = await axios.post(process.env.IMAGE_PROCESSING_API_URL, formData, {
-        headers: {
-            'Content-Type': `multipart/form-data; boundary=${formData.getBoundary()}`,
-            'x-api-key': `${process.env.IMAGE_PROCESSING_API_KEY}`,
-            'pr-ai-background-model-version': `background-studio-beta-2025-03-17`,
-        },
-        responseType: 'arraybuffer',
-        timeout: 15000,
-        signal: abortSignal
-    });
+    let response;
+    try {
+        response = await axios.post(process.env.IMAGE_PROCESSING_API_URL, formData, {
+            headers: {
+                'Content-Type': `multipart/form-data; boundary=${formData.getBoundary()}`,
+                'x-api-key': `${process.env.IMAGE_PROCESSING_API_KEY}`,
+                'pr-ai-background-model-version': `background-studio-beta-2025-03-17`,
+            },
+            responseType: 'arraybuffer',
+            timeout: 15000,
+            signal: abortSignal
+        });
+    } catch (err) {
+        // responseType:'arraybuffer' makes axios stash Photoroom's JSON error as a
+        // Buffer on err.response.data — which has no .message, so the generic
+        // "Request failed with status code 400" is all that surfaced upstream.
+        // Decode it here so the real reason ("background.prompt must not be empty",
+        // bad param, etc.) reaches the logs and the job's error field.
+        throw decodePhotoroomError(err);
+    }
 
     return {
         imageBase64: Buffer.from(response.data, 'binary').toString('base64'),
         seed: seedToUse,
     };
+}
+
+// Photoroom replies to errors with a small JSON body. When the request used
+// responseType:'arraybuffer', axios leaves that body as a Buffer on
+// err.response.data. Decode it to a readable Error so callers don't log an
+// opaque byte dump. Falls back to the original error if there's nothing to read.
+function decodePhotoroomError(err) {
+    const data = err?.response?.data;
+    if (!data) return err;
+    try {
+        const text = Buffer.isBuffer(data) ? data.toString('utf8') : String(data);
+        let detail = text;
+        try {
+            const parsed = JSON.parse(text);
+            detail = parsed.error?.message || parsed.detail || parsed.message || text;
+        } catch { /* not JSON — use raw text */ }
+        const status = err.response?.status;
+        const wrapped = new Error(`Photoroom ${status || ''} ${detail}`.trim());
+        wrapped.status = status;
+        wrapped.cause = err;
+        return wrapped;
+    } catch {
+        return err;
+    }
 }
 
 // Phase 6.7.5 — pre-generation cutout preview. Calls Photoroom's cheaper
@@ -514,17 +564,23 @@ const PHOTOROOM_SEGMENT_API_URL = 'https://sdk.photoroom.com/v1/segment';
 export async function previewSegmentation(imageBuffer, originalName, abortSignal) {
     const formData = new FormData();
     formData.append('image_file', imageBuffer, { filename: originalName || 'upload.png' });
-    formData.append('segmentation.mode', SEGMENTATION_MODE);
+    // No segmentation.* params — default segmentation keeps the salient subject,
+    // matching the /v2/edit generate call so the preview predicts the real cutout.
 
-    const response = await axios.post(PHOTOROOM_SEGMENT_API_URL, formData, {
-        headers: {
-            'Content-Type': `multipart/form-data; boundary=${formData.getBoundary()}`,
-            'x-api-key': `${process.env.IMAGE_PROCESSING_API_KEY}`,
-        },
-        responseType: 'arraybuffer',
-        timeout: 15000,
-        signal: abortSignal,
-    });
+    let response;
+    try {
+        response = await axios.post(PHOTOROOM_SEGMENT_API_URL, formData, {
+            headers: {
+                'Content-Type': `multipart/form-data; boundary=${formData.getBoundary()}`,
+                'x-api-key': `${process.env.IMAGE_PROCESSING_API_KEY}`,
+            },
+            responseType: 'arraybuffer',
+            timeout: 15000,
+            signal: abortSignal,
+        });
+    } catch (err) {
+        throw decodePhotoroomError(err);
+    }
 
     return Buffer.from(response.data, 'binary');
 }
