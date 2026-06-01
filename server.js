@@ -9,35 +9,10 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import pinoHttp from 'pino-http';
 import { generateMarketingCopy, processImageBackground, enhanceImageWithClaid, refineMarketingCopy, refineBackgroundPrompt, previewSegmentation } from './services.js';
 import requireToken from './middleware/requireToken.js';
 import logger from './logger.js';
-
-// Phase 6.7.3 — scene reference cache. Loaded once on boot, kept in memory.
-// Same pattern Phase 7A's watermark will use. Missing files are not an error;
-// the cache simply omits that vibe and processJob falls through to text-only
-// background generation. See snapit-backend/assets/scenes/README.md for the
-// Owner-action checklist of what files need to land here.
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SCENE_VIBES = ['kopitiam', 'cafe', 'street', 'premium'];
-const SCENE_CACHE = new Map();
-for (const vibe of SCENE_VIBES) {
-    const filePath = path.join(__dirname, 'assets', 'scenes', `${vibe}.jpg`);
-    try {
-        const buf = fs.readFileSync(filePath);
-        SCENE_CACHE.set(vibe, { buffer: buf, filename: `${vibe}.jpg` });
-    } catch {
-        // File missing — text-only fallback. No log noise until first use.
-    }
-}
-logger.info(
-    { loaded: [...SCENE_CACHE.keys()], expected: SCENE_VIBES },
-    'scene_cache.boot'
-);
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -324,22 +299,14 @@ async function processJob(jobId, file, body) {
         let bgSeed = null;
         if (shouldGenerateBg) {
             const bgStart = Date.now();
-            // Standard mode: send a style-reference image if we have one
-            // cached for the selected vibe. Pro mode stays text-only (the
-            // vendor's free-form description is the signal there). Missing
-            // cache entries are silent fallback — see SCENE_CACHE init.
-            const isPro = body.isContextPro === 'true';
-            const sceneAsset = !isPro && body.backgroundVibe
-                ? SCENE_CACHE.get(body.backgroundVibe)
-                : null;
+            // Background is text-only: the LLM-authored backgroundPrompt is the
+            // sole signal. Both Standard (vibe → prompt) and Pro (free-form
+            // description → prompt) flow through the same path.
             const bgResult = await processImageBackground(
                 imageBuffer,
                 originalName,
                 copyResult.backgroundPrompt,
-                abortController.signal,
-                sceneAsset
-                    ? { guidanceImageBuffer: sceneAsset.buffer, guidanceFilename: sceneAsset.filename }
-                    : undefined
+                abortController.signal
             );
             generatedImageBase64 = bgResult.imageBase64;
             bgSeed = bgResult.seed;
@@ -347,7 +314,6 @@ async function processJob(jobId, file, body) {
                 {
                     ms: Date.now() - bgStart,
                     seed: bgSeed,
-                    guidance: sceneAsset ? body.backgroundVibe : null,
                 },
                 'job.bg_done'
             );

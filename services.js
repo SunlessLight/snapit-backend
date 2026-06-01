@@ -465,7 +465,7 @@ export async function enhanceImageWithClaid(imageBuffer, mimeType, abortSignal) 
 // so the preview faithfully predicts the generate.
 
 export async function processImageBackground(imageBuffer, originalName, backgroundPrompt, abortSignal, options = {}) {
-    const { guidanceImageBuffer, guidanceFilename, seed } = options;
+    const { seed } = options;
 
     // Phase 6.7.4 — deterministic-seed support. We always pick a seed locally
     // (random uint32 when caller didn't supply one) rather than relying on
@@ -491,17 +491,8 @@ export async function processImageBackground(imageBuffer, originalName, backgrou
     formData.append('background.expandPrompt.mode', 'ai.never');
     formData.append('background.seed', String(seedToUse));
     // No segmentation.* params — default segmentation keeps the salient subject.
-
-    // Phase 6.7.3 — optional style-reference image. Photoroom uses this for
-    // surface, lighting, palette, and mood; composition is still driven by
-    // the food photo's own perspective. scale=0.6 is Photoroom's documented
-    // default — controls how strongly the reference influences output.
-    if (guidanceImageBuffer) {
-        formData.append('background.guidance.imageFile', guidanceImageBuffer, {
-            filename: guidanceFilename || 'guidance.jpg',
-        });
-        formData.append('background.guidance.scale', '0.6');
-    }
+    // Background is text-only: background.prompt (from the LLM) is the sole
+    // background signal — no image guidance (see CLAUDE.md Phase 6.7).
 
     let response;
     try {
