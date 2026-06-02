@@ -544,34 +544,3 @@ function decodePhotoroomError(err) {
         return err;
     }
 }
-
-// Phase 6.7.5 — pre-generation cutout preview. Calls Photoroom's cheaper
-// /v1/segment endpoint (sdk.photoroom.com, not image-api.photoroom.com — they
-// live on different bases) which returns just the subject on transparent
-// background. The point is to give the user a "looks right / retake" gate
-// BEFORE the expensive /v2/edit call, saving the credit on bad photos.
-const PHOTOROOM_SEGMENT_API_URL = 'https://sdk.photoroom.com/v1/segment';
-
-export async function previewSegmentation(imageBuffer, originalName, abortSignal) {
-    const formData = new FormData();
-    formData.append('image_file', imageBuffer, { filename: originalName || 'upload.png' });
-    // No segmentation.* params — default segmentation keeps the salient subject,
-    // matching the /v2/edit generate call so the preview predicts the real cutout.
-
-    let response;
-    try {
-        response = await axios.post(PHOTOROOM_SEGMENT_API_URL, formData, {
-            headers: {
-                'Content-Type': `multipart/form-data; boundary=${formData.getBoundary()}`,
-                'x-api-key': `${process.env.IMAGE_PROCESSING_API_KEY}`,
-            },
-            responseType: 'arraybuffer',
-            timeout: 15000,
-            signal: abortSignal,
-        });
-    } catch (err) {
-        throw decodePhotoroomError(err);
-    }
-
-    return Buffer.from(response.data, 'binary');
-}

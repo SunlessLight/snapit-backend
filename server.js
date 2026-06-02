@@ -10,7 +10,7 @@ import cors from 'cors';
 import multer from 'multer';
 import crypto from 'crypto';
 import pinoHttp from 'pino-http';
-import { generateMarketingCopy, processImageBackground, enhanceImageWithClaid, refineMarketingCopy, refineBackgroundPrompt, previewSegmentation } from './services.js';
+import { generateMarketingCopy, processImageBackground, enhanceImageWithClaid, refineMarketingCopy, refineBackgroundPrompt } from './services.js';
 import requireToken from './middleware/requireToken.js';
 import logger from './logger.js';
 
@@ -241,32 +241,6 @@ app.post('/api/regenerate/background', upload.single('image'), async (req, res) 
         abortController.abort();
         log.error({ err: error, ms: Date.now() - started }, `regen.bg.failed: ${error.message}`);
         res.status(502).json({ success: false, error: error.message || 'Background regen failed' });
-    }
-});
-
-// Phase 6.7.5 — pre-generation mask preview. Sync (~2-4s) — user is waiting
-// on the MaskPreview screen. Returns a PNG cutout (subject on transparent
-// background) so the user can decide "looks right" → continue to /api/generate,
-// or "retake" → back to Upload without spending a /v2/edit credit.
-app.post('/api/segmentation-preview', upload.single('image'), async (req, res) => {
-    if (!req.file) {
-        return res.status(400).json({ success: false, error: 'Image file is required.' });
-    }
-
-    const abortController = new AbortController();
-    const started = Date.now();
-    const log = logger.child({ route: 'segmentation-preview', size: req.file.size, mime: req.file.mimetype });
-    log.info('segment.start');
-
-    try {
-        const cutoutBuffer = await previewSegmentation(req.file.buffer, req.file.originalname, abortController.signal);
-        log.info({ ms: Date.now() - started, outBytes: cutoutBuffer.length }, 'segment.done');
-        res.set('Content-Type', 'image/png').send(cutoutBuffer);
-    } catch (error) {
-        abortController.abort();
-        const errorMessage = error.response?.data?.toString?.() || error.message || 'Segment failed';
-        log.error({ err: error, ms: Date.now() - started }, `segment.failed: ${errorMessage}`);
-        res.status(502).json({ success: false, error: errorMessage });
     }
 });
 
