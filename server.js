@@ -25,11 +25,25 @@ const JOB_TTL_MS = 10 * 60 * 1000;
 // phones after the frontend's browser-image-compression pass.
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
 
+// Comma-separated allowlist from env; localhost dev default. Trailing slashes stripped
+// so "https://site.app/" and "https://site.app" are treated the same.
+const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:5173')
+    .split(',')
+    .map((o) => o.trim().replace(/\/+$/, ''))
+    .filter(Boolean);
+
 if (!process.env.FRONTEND_URL) {
-    logger.warn('[boot] FRONTEND_URL is not set — CORS will reject all browser origins. Set it in .env (e.g. http://localhost:5173 for dev).');
+    logger.warn('[boot] FRONTEND_URL is not set — only localhost origins are allowed. Set it (comma-separated for multiple) to your Netlify URL in production.');
 }
+
 const corsOptions = {
-    origin: process.env.FRONTEND_URL,
+    origin(origin, callback) {
+        // No Origin header = same-origin or non-browser client (curl, health checks).
+        if (!origin) return callback(null, true);
+        const normalized = origin.replace(/\/+$/, '');
+        if (allowedOrigins.includes(normalized)) return callback(null, true);
+        return callback(new Error(`Origin ${origin} not allowed by CORS`));
+    },
     optionsSuccessStatus: 200
 };
 app.use(cors(corsOptions));
