@@ -7,11 +7,14 @@ if (!process.env.OPENROUTER_API_KEY) {
 
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import multer from 'multer';
 import crypto from 'crypto';
 import pinoHttp from 'pino-http';
 import { generateMarketingCopy, processImageBackground, enhanceImageWithClaid, refineMarketingCopy, refineBackgroundPrompt } from './services.js';
 import requireToken from './middleware/requireToken.js';
+import { consumeCredit, refundCredit, getBalance } from './credits.js';
 import logger from './logger.js';
 
 const app = express();
@@ -44,9 +47,38 @@ const corsOptions = {
         if (allowedOrigins.includes(normalized)) return callback(null, true);
         return callback(new Error(`Origin ${origin} not allowed by CORS`));
     },
+    // /api/enhance returns a binary body; the new balance rides in this header so
+    // the browser must be allowed to read it cross-origin.
+    exposedHeaders: ['X-Credit-Balance'],
     optionsSuccessStatus: 200
 };
+// helmet first so security headers cover every response, including errors.
+// crossOriginResourcePolicy is relaxed because /api/enhance serves image bytes
+// that the (cross-origin) Netlify frontend fetches.
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors(corsOptions));
+
+// Coarse per-IP flood guard on the whole API — fires before auth so an
+// unauthenticated script can't hammer the box. The real per-user metering is
+// the credit balance; this just caps raw request volume.
+const globalLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: 120,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { success: false, error: 'RATE_LIMITED' },
+});
+
+// Tighter limiter for the paid routes, keyed by user id once authenticated
+// (falls back to IP for unauthenticated callers, who are rejected anyway).
+const paidLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: 20,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    keyGenerator: (req) => req.user?.id || req.ip,
+    message: { success: false, error: 'RATE_LIMITED' },
+});
 app.use(pinoHttp({
     logger,
     customLogLevel: (req, res, err) => {
@@ -62,17 +94,57 @@ app.use(pinoHttp({
     },
 }));
 app.use(express.json());
+app.use(globalLimiter);
 
+// Only accept actual image uploads. Anything else (PDFs, zips, etc.) is rejected
+// before it reaches a paid API. HEIC/HEIF included because some phones upload
+// them pre-conversion; the frontend usually converts, but be permissive on input.
+const ALLOWED_UPLOAD_MIMES = new Set([
+    'image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif',
+]);
 const storage = multer.memoryStorage();
-const upload = multer({ storage: storage, limits: { fileSize: MAX_UPLOAD_BYTES } });
+const upload = multer({
+    storage: storage,
+    limits: { fileSize: MAX_UPLOAD_BYTES },
+    fileFilter(req, file, cb) {
+        if (ALLOWED_UPLOAD_MIMES.has(file.mimetype)) return cb(null, true);
+        cb(new multer.MulterError('LIMIT_UNEXPECTED_FILE', 'image'));
+    },
+});
+
+// Free-text length caps. These fields flow into the LLM prompt, so an
+// unbounded value is both a cost and a prompt-injection surface. We truncate
+// rather than reject so a slightly-long value never breaks the UX.
+const TEXT_CAPS = {
+    dishName: 120,
+    price: 40,
+    description: 1000,
+    backgroundDescription: 300,
+    changePrompt: 300,
+    currentCaption: 4000,
+    currentNoteTitle: 200,
+    location: 200,
+    hours: 200,
+    contact: 200,
+    originalBackgroundPrompt: 2000,
+};
+function capBodyText(body) {
+    if (!body) return;
+    for (const [field, max] of Object.entries(TEXT_CAPS)) {
+        if (typeof body[field] === 'string' && body[field].length > max) {
+            body[field] = body[field].slice(0, max);
+        }
+    }
+}
 
 const jobs = new Map();
 
-app.post('/api/generate', upload.single('image'), (req, res) => {
+app.post('/api/generate', requireToken, paidLimiter, upload.single('image'), async (req, res) => {
     // 1. Validation phase
     if (!req.file) {
         return res.status(400).json({ success: false, error: 'Image file is required.' });
     }
+    capBodyText(req.body);
 
     // Extract text fields exactly as your old code did[cite: 1]
     const {
@@ -123,20 +195,42 @@ app.post('/api/generate', upload.single('image'), (req, res) => {
         logger.info({ dishName }, 'pro media editor enabled');
     }
 
-    // 2. Job Creation phase
+    // 2. Metering — consume one credit now (atomic). If processJob later fails
+    //    we refund it there, so the user is only charged for work we deliver.
+    let balance;
+    try {
+        balance = await consumeCredit(req.user.id);
+    } catch {
+        return res.status(503).json({ success: false, error: 'Service temporarily unavailable.' });
+    }
+    if (balance === null) {
+        return res.status(402).json({ success: false, error: 'OUT_OF_CREDITS' });
+    }
+
+    // 3. Job Creation phase
     const jobId = crypto.randomUUID();
     jobs.set(jobId, { status: 'processing', data: null, error: null });
 
-    // 3. Immediate Response
-    res.status(202).json({ success: true, jobId, message: 'Job accepted. Begin polling.' });
+    // 4. Immediate Response (balance lets the frontend update the pill at once)
+    res.status(202).json({ success: true, jobId, balance, message: 'Job accepted. Begin polling.' });
 
-    // 4. Asynchronous Processing (Do not await)
-    processJob(jobId, req.file, req.body);
+    // 5. Asynchronous Processing (Do not await). userId so a failure can refund.
+    processJob(jobId, req.file, req.body, req.user.id);
 });
 
-app.post('/api/enhance', requireToken, upload.single('image'), async (req, res) => {
+app.post('/api/enhance', requireToken, paidLimiter, upload.single('image'), async (req, res) => {
     if (!req.file) {
         return res.status(400).json({ success: false, error: 'Image file is required.' });
+    }
+
+    let balance;
+    try {
+        balance = await consumeCredit(req.user.id);
+    } catch {
+        return res.status(503).json({ success: false, error: 'Service temporarily unavailable.' });
+    }
+    if (balance === null) {
+        return res.status(402).json({ success: false, error: 'OUT_OF_CREDITS' });
     }
 
     const abortController = new AbortController();
@@ -147,22 +241,28 @@ app.post('/api/enhance', requireToken, upload.single('image'), async (req, res) 
     try {
         const enhancedBuffer = await enhanceImageWithClaid(req.file.buffer, req.file.mimetype, abortController.signal);
         enhanceLog.info({ ms: Date.now() - started, outBytes: enhancedBuffer.length }, 'enhance.done');
-        res.set('Content-Type', 'image/jpeg').send(enhancedBuffer);
+        // Binary body — surface the new balance via a header (CORS-exposed above).
+        res.set('Content-Type', 'image/jpeg').set('X-Credit-Balance', String(balance)).send(enhancedBuffer);
     } catch (error) {
         abortController.abort();
-        const errorMessage = error.response?.data?.toString?.() || error.message || 'Enhance failed';
-        enhanceLog.error({ err: error, ms: Date.now() - started }, `enhance.failed: ${errorMessage}`);
-        res.status(502).json({ success: false, error: errorMessage });
+        await refundCredit(req.user.id); // didn't deliver — don't charge
+        // Log the upstream detail server-side; return a generic message to the client.
+        const detail = error.response?.data?.toString?.() || error.message || 'Enhance failed';
+        enhanceLog.error({ err: error, ms: Date.now() - started }, `enhance.failed: ${detail}`);
+        res.status(502).json({ success: false, error: 'Enhancement failed. Please try again.' });
     }
 });
 
 // Assistive-mode caption regen. Sync — user is sitting on the Review screen.
 // Re-sends image instead of relying on the jobs Map so the loop's lifetime is
 // not coupled to the 10-min TTL.
-app.post('/api/regenerate/captions', upload.single('image'), async (req, res) => {
+// Auth-gated but free: caption regen is an LLM-only call (no Claid/Photoroom
+// credit), so it requires a valid token but does NOT consume a credit.
+app.post('/api/regenerate/captions', requireToken, paidLimiter, upload.single('image'), async (req, res) => {
     if (!req.file) {
         return res.status(400).json({ success: false, error: 'Image file is required.' });
     }
+    capBodyText(req.body);
     const {
         dishName, price, outputLanguage, tone, captionLength,
         isContextPro, description, platform, location, hours, contact,
@@ -194,20 +294,33 @@ app.post('/api/regenerate/captions', upload.single('image'), async (req, res) =>
         });
     } catch (error) {
         log.error({ err: error, ms: Date.now() - started }, `regen.captions.failed: ${error.message}`);
-        res.status(502).json({ success: false, error: error.message || 'Caption regen failed' });
+        res.status(502).json({ success: false, error: 'Caption regeneration failed. Please try again.' });
     }
 });
 
 // Assistive-mode background regen. Always runs on the ORIGINAL food image
 // (frontend sends mediaState.originalFile, not the previously bg-swapped output)
 // so artifacts don't compound across iterations.
-app.post('/api/regenerate/background', upload.single('image'), async (req, res) => {
+app.post('/api/regenerate/background', requireToken, paidLimiter, upload.single('image'), async (req, res) => {
     if (!req.file) {
         return res.status(400).json({ success: false, error: 'Image file is required.' });
     }
+    capBodyText(req.body);
     const { originalBackgroundPrompt, changePrompt, seedMode, lastSeed } = req.body;
     if (!originalBackgroundPrompt) {
         return res.status(400).json({ success: false, error: 'originalBackgroundPrompt is required.' });
+    }
+
+    // Photoroom call — meter it. Consumed after validation so a bad request
+    // never costs a credit; refunded in the catch if Photoroom fails.
+    let balance;
+    try {
+        balance = await consumeCredit(req.user.id);
+    } catch {
+        return res.status(503).json({ success: false, error: 'Service temporarily unavailable.' });
+    }
+    if (balance === null) {
+        return res.status(402).json({ success: false, error: 'OUT_OF_CREDITS' });
     }
 
     // Phase 6.7.4 — seedMode controls whether we replay last call's seed
@@ -249,12 +362,14 @@ app.post('/api/regenerate/background', upload.single('image'), async (req, res) 
             success: true,
             generatedImageBase64: bgResult.imageBase64,
             backgroundPrompt: refined.backgroundPrompt,
-            bgSeed: bgResult.seed
+            bgSeed: bgResult.seed,
+            balance
         });
     } catch (error) {
         abortController.abort();
+        await refundCredit(req.user.id); // didn't deliver — don't charge
         log.error({ err: error, ms: Date.now() - started }, `regen.bg.failed: ${error.message}`);
-        res.status(502).json({ success: false, error: error.message || 'Background regen failed' });
+        res.status(502).json({ success: false, error: 'Background regeneration failed. Please try again.' });
     }
 });
 
@@ -266,7 +381,18 @@ app.get('/api/status/:jobId', (req, res) => {
     res.status(200).json(job);
 });
 
-async function processJob(jobId, file, body) {
+// Current credit balance for the signed-in user. Read-only (no consume) — drives
+// the header pill and lets the UI gate actions before the user spends a request.
+app.get('/api/me/balance', requireToken, async (req, res) => {
+    try {
+        const balance = await getBalance(req.user.id);
+        res.status(200).json({ success: true, balance });
+    } catch {
+        res.status(503).json({ success: false, error: 'Service temporarily unavailable.' });
+    }
+});
+
+async function processJob(jobId, file, body, userId) {
     const abortController = new AbortController();
     const jobLog = logger.child({ jobId, dish: body.dishName });
     const started = Date.now();
@@ -337,11 +463,34 @@ async function processJob(jobId, file, body) {
         }
 
         jobLog.error({ err: error, totalMs: Date.now() - started }, `job.failed: ${errorMessage}`);
+        // The credit was consumed at request time; the job failed, so refund it.
+        await refundCredit(userId);
         jobs.set(jobId, { status: 'failed', data: null, error: errorMessage });
     }
 
     setTimeout(() => { jobs.delete(jobId); }, JOB_TTL_MS);
 }
+
+// Terminal JSON error handler. Multer (bad mimetype / too large) and CORS
+// rejections would otherwise surface as Express's default HTML error page with
+// a 500 — and that page carries no CORS headers, so the browser shows an opaque
+// "Failed to fetch". Map the known cases to clean JSON; mask everything else.
+app.use((err, req, res, next) => {
+    if (res.headersSent) return next(err);
+    if (err instanceof multer.MulterError) {
+        const msg = err.code === 'LIMIT_FILE_SIZE'
+            ? 'Image is too large (max 5MB).'
+            : err.code === 'LIMIT_UNEXPECTED_FILE'
+                ? 'Unsupported file type. Please upload an image.'
+                : 'Upload rejected.';
+        return res.status(400).json({ success: false, error: msg });
+    }
+    if (err?.message?.includes('not allowed by CORS')) {
+        return res.status(403).json({ success: false, error: 'Origin not allowed.' });
+    }
+    logger.error({ err }, 'unhandled.error');
+    res.status(500).json({ success: false, error: 'Internal server error.' });
+});
 
 app.listen(port, () => {
     logger.info({ port }, 'SnapIT backend listening');
