@@ -211,19 +211,22 @@ export async function generateMarketingCopy(imageBuffer, mimeType, params) {
 
         ${shouldGenerateBg ? `
         --- TASK 2: BACKGROUND GENERATION PROMPT ---
-        Determine the camera perspective of the uploaded food image:
-        - Is it a Top-Down (flatlay) shot pointing straight down?
-        - Or is it an Angled/Profile shot showing depth?
+        Look at the uploaded photo and decide what is visible AROUND the dish, then classify the camera perspective into ONE of these three regimes:
+        - FLATLAY: shot pointing straight down. Only a flat surface is visible around the dish; no sense of depth.
+        - TABLE-LEVEL ANGLE: shot looking down at the table at a tilt. The dish sits on a surface that extends and recedes in ALL directions; the area behind and above the dish is still the SAME eating surface (same material), not a separate standing space. No wall, no horizon. This is the most common phone-photo case.
+        - PROFILE / LOW ANGLE: the camera is nearly level with the dish. There is a CLEAR break between the near surface (lower part of the frame) and a distinct standing space behind it (a wall, window, room, or open air).
+        When unsure between TABLE-LEVEL and PROFILE, choose TABLE-LEVEL — inventing a wall that is not there is the worse mistake.
 
-        Write the 'backgroundPrompt' based on the perspective and the Background Vibe ("${backgroundVibeString}").
+        Write the 'backgroundPrompt' from the chosen regime and the Background Vibe ("${backgroundVibeString}"). The Background Vibe supplies the MOOD, surface MATERIAL, and LIGHTING; the perspective regime decides the SPATIAL LAYOUT. So a "blurred background" mood cue becomes blur on the receding surface in a TABLE-LEVEL shot, not a separate wall.
         ${hasProBgDescription ? `
         IMPORTANT — VENDOR-PROVIDED BACKGROUND:
         The Background Vibe above came verbatim from the vendor. Use it as the primary creative direction. Polish it into a professional food-photography prompt by adding lighting, surface texture, and depth-of-field details that stay faithful to their intent. Do not invent contradictory elements (e.g., do not change "marble" to "wood"). If the vendor's text is sparse, expand with food-photography fundamentals; if it is detailed, preserve its specifics.
         ` : ''}
         CRITICAL RULES FOR BACKGROUND PROMPT:
         1. DO NOT describe the food itself. The food is already cut out.
-        2. IF TOP-DOWN: Describe ONLY a flat surface texture directly beneath the food. Do NOT mention a background, room, or depth of field.
-        3. IF ANGLED: Describe the surface beneath the food AND a softly blurred environment behind it to create depth.
+        2. IF FLATLAY: Describe ONLY a flat surface texture filling the frame beneath the dish. Do NOT mention a background, room, horizon, or depth of field.
+        3. IF TABLE-LEVEL ANGLE: Describe a surface that FILLS THE WHOLE FRAME and extends around the dish, gently receding and softly out of focus toward the top/far edge. Do NOT introduce a separate vertical background, wall, or horizon line — the surface itself is the entire scene, blurred with depth of field as it recedes.
+        4. IF PROFILE / LOW ANGLE: Describe the surface beneath the dish in the foreground AND a softly blurred standing environment behind it to create depth.
         ` : `
         --- TASK 2: BACKGROUND GENERATION PROMPT ---
         Ignore this task. Just return "N/A" for the backgroundPrompt field.
@@ -378,7 +381,7 @@ export async function refineBackgroundPrompt(originalBackgroundPrompt, changePro
 
         CRITICAL RULES:
         1. DO NOT describe the food itself — the food is already cut out.
-        2. Preserve the original prompt's camera-perspective intent (flatlay surface only, or angled with depth-of-field background).
+        2. Preserve the original prompt's perspective regime — flatlay (surface only), table-level angle (surface filling the frame and receding, with NO separate vertical background or wall), or profile/low angle (surface plus a blurred standing background). You have no image here, so keep whichever spatial layout the original prompt already expresses; do not switch regimes.
         3. Keep surface, lighting, and mood details concrete — avoid vague adjectives.
         4. Return ONE single coherent prompt as the backgroundPrompt field. Do not return alternatives or commentary.
     `;
@@ -403,13 +406,16 @@ const CLAID_FOOD_OPERATIONS = {
         "polish": true
     },
     "resizing": {
-        "width": "150%",
-        "height": "150%",
+        "width": "120%",
+        "height": "120%",
     },
     "adjustments": {
         "hdr": { "intensity": 60 },
-        "sharpness": 25,
+        "sharpness": 10,
         "saturation": 15,
+    },
+    "output": {
+        "format": { "type": "jpeg", "quality": 90 }
     },
 };
 
