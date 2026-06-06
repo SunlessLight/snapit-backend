@@ -413,10 +413,14 @@ const CLAID_FOOD_OPERATIONS = {
         "hdr": { "intensity": 60 },
         "sharpness": 10,
         "saturation": 15,
-    },
-    "output": {
-        "format": { "type": "jpeg", "quality": 90 }
-    },
+    }
+};
+
+// `output` is a TOP-LEVEL sibling of `operations` in Claid's EditRequest — NOT a
+// key inside operations. Claid's operations schema is additionalProperties:false,
+// so nesting `output` there makes Claid reject the whole request with a 400.
+const CLAID_OUTPUT = {
+    format: { type: 'jpeg', quality: 90 }
 };
 
 export async function enhanceImageWithClaid(imageBuffer, mimeType, abortSignal) {
@@ -426,18 +430,26 @@ export async function enhanceImageWithClaid(imageBuffer, mimeType, abortSignal) 
 
     const formData = new FormData();
     formData.append('file', imageBuffer, { filename: `upload.${mimeType.split('/')[1] || 'jpg'}`, contentType: mimeType });
-    formData.append('data', JSON.stringify({ operations: CLAID_FOOD_OPERATIONS }));
+    formData.append('data', JSON.stringify({ operations: CLAID_FOOD_OPERATIONS, output: CLAID_OUTPUT }));
 
     // Step 1: upload + process. /v1/image/edit/upload returns JSON with a tmp_url —
     // NOT the binary. The /v1-ext/... path does not exist (returns 404).
-    const uploadResponse = await axios.post('https://api.claid.ai/v1/image/edit/upload', formData, {
-        headers: {
-            ...formData.getHeaders(),
-            'Authorization': `Bearer ${process.env.CLAID_API_KEY}`,
-        },
-        timeout: 30000,
-        signal: abortSignal,
-    });
+    let uploadResponse;
+    try {
+        uploadResponse = await axios.post('https://api.claid.ai/v1/image/edit/upload', formData, {
+            headers: {
+                ...formData.getHeaders(),
+                'Authorization': `Bearer ${process.env.CLAID_API_KEY}`,
+            },
+            timeout: 30000,
+            signal: abortSignal,
+        });
+    } catch (err) {
+        // Claid returns a JSON error body. axios auto-parses it into an object, so a
+        // plain .toString() upstream yields "[object Object]" and hides the reason.
+        // Decode it into a readable Error here (mirrors decodePhotoroomError).
+        throw decodeClaidError(err);
+    }
 
     const tmpUrl = uploadResponse?.data?.data?.output?.tmp_url;
     if (!tmpUrl) {
@@ -543,6 +555,34 @@ function decodePhotoroomError(err) {
         } catch { /* not JSON — use raw text */ }
         const status = err.response?.status;
         const wrapped = new Error(`Photoroom ${status || ''} ${detail}`.trim());
+        wrapped.status = status;
+        wrapped.cause = err;
+        return wrapped;
+    } catch {
+        return err;
+    }
+}
+
+// Claid replies to errors with a JSON body. The upload POST uses the default
+// (JSON) responseType, so axios leaves err.response.data as a parsed OBJECT —
+// a plain .toString() on it yields "[object Object]". Decode it into a readable
+// Error so the real reason ("validation error", a bad operations key, etc.)
+// reaches the logs. Falls back to the original error if there's nothing to read.
+function decodeClaidError(err) {
+    const data = err?.response?.data;
+    if (!data) return err;
+    try {
+        let detail;
+        if (Buffer.isBuffer(data)) {
+            detail = data.toString('utf8');
+        } else if (typeof data === 'object') {
+            // Pull a human field if Claid provides one, else serialize the body.
+            detail = data.error_message || data.detail || data.message || JSON.stringify(data);
+        } else {
+            detail = String(data);
+        }
+        const status = err.response?.status;
+        const wrapped = new Error(`Claid ${status || ''} ${detail}`.trim());
         wrapped.status = status;
         wrapped.cause = err;
         return wrapped;

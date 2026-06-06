@@ -247,7 +247,14 @@ app.post('/api/enhance', requireToken, paidLimiter, upload.single('image'), asyn
         abortController.abort();
         await refundCredit(req.user.id); // didn't deliver — don't charge
         // Log the upstream detail server-side; return a generic message to the client.
-        const detail = error.response?.data?.toString?.() || error.message || 'Enhance failed';
+        // enhanceImageWithClaid already wraps Claid errors via decodeClaidError, so
+        // error.message carries the real reason. Fall back to serializing any raw body
+        // (JSON.stringify, not .toString() — an object .toString() is "[object Object]").
+        const rawBody = error.response?.data;
+        const bodyDetail = Buffer.isBuffer(rawBody)
+            ? rawBody.toString('utf8')
+            : (rawBody && typeof rawBody === 'object' ? JSON.stringify(rawBody) : rawBody);
+        const detail = error.message || bodyDetail || 'Enhance failed';
         enhanceLog.error({ err: error, ms: Date.now() - started }, `enhance.failed: ${detail}`);
         res.status(502).json({ success: false, error: 'Enhancement failed. Please try again.' });
     }
