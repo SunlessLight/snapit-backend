@@ -10,11 +10,13 @@ import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import multer from 'multer';
+import sharp from 'sharp';
 import crypto from 'crypto';
 import pinoHttp from 'pino-http';
 import { generateMarketingCopy, processImageBackground, enhanceImageWithClaid, refineMarketingCopy, refineBackgroundPrompt } from './services.js';
 import requireToken from './middleware/requireToken.js';
 import { consumeCredit, refundCredit, getBalance } from './credits.js';
+import { logUsage } from './usageLog.js';
 import logger from './logger.js';
 
 const app = express();
@@ -241,11 +243,21 @@ app.post('/api/enhance', requireToken, paidLimiter, upload.single('image'), asyn
     try {
         const enhancedBuffer = await enhanceImageWithClaid(req.file.buffer, req.file.mimetype, abortController.signal);
         enhanceLog.info({ ms: Date.now() - started, outBytes: enhancedBuffer.length }, 'enhance.done');
+        // Claid reports no per-call cost — this row is a call counter for
+        // dashboard reconciliation (see usageLog.js).
+        void logUsage({
+            userId: req.user.id, provider: 'claid', operation: 'enhance',
+            success: true, snapitCredits: 1, meta: { ms: Date.now() - started, outBytes: enhancedBuffer.length },
+        });
         // Binary body — surface the new balance via a header (CORS-exposed above).
         res.set('Content-Type', 'image/jpeg').set('X-Credit-Balance', String(balance)).send(enhancedBuffer);
     } catch (error) {
         abortController.abort();
         await refundCredit(req.user.id); // didn't deliver — don't charge
+        void logUsage({
+            userId: req.user.id, provider: 'claid', operation: 'enhance',
+            success: false, snapitCredits: 0, meta: { ms: Date.now() - started, error: error.message },
+        });
         // Log the upstream detail server-side; return a generic message to the client.
         // enhanceImageWithClaid already wraps Claid errors via decodeClaidError, so
         // error.message carries the real reason. Fall back to serializing any raw body
@@ -257,6 +269,30 @@ app.post('/api/enhance', requireToken, paidLimiter, upload.single('image'), asyn
         const detail = error.message || bodyDetail || 'Enhance failed';
         enhanceLog.error({ err: error, ms: Date.now() - started }, `enhance.failed: ${detail}`);
         res.status(502).json({ success: false, error: 'Enhancement failed. Please try again.' });
+    }
+});
+
+// HEIC/HEIF → JPEG conversion, server-side via sharp (libvips, native — no eval).
+// iPhone photos arrive as HEIC, which Chrome/Firefox can't decode. The old
+// client-side heic2any used `new Function`, which the production CSP (script-src
+// 'self', no unsafe-eval) blocks. Auth-gated but FREE — same posture as caption
+// regen: a valid token is required, but no Claid/Photoroom credit is consumed.
+app.post('/api/convert-heic', requireToken, paidLimiter, upload.single('image'), async (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ success: false, error: 'Image file is required.' });
+    }
+    const started = Date.now();
+    const convLog = logger.child({ route: 'convert-heic', size: req.file.size, mime: req.file.mimetype });
+    convLog.info('convert.start');
+    try {
+        // sharp's prebuilt libvips bundles libheif (decode) — read HEIC, write JPEG.
+        // We only DECODE HEIC; JPEG encode is unencumbered.
+        const jpegBuffer = await sharp(req.file.buffer).rotate().jpeg({ quality: 90 }).toBuffer();
+        convLog.info({ ms: Date.now() - started, outBytes: jpegBuffer.length }, 'convert.done');
+        res.set('Content-Type', 'image/jpeg').send(jpegBuffer);
+    } catch (error) {
+        convLog.error({ err: error, ms: Date.now() - started }, `convert.failed: ${error.message}`);
+        res.status(502).json({ success: false, error: 'Image conversion failed. Please try again.' });
     }
 });
 
@@ -293,6 +329,15 @@ app.post('/api/regenerate/captions', requireToken, paidLimiter, upload.single('i
             changePrompt
         );
         log.info({ ms: Date.now() - started, provider: result.provider }, 'regen.captions.done');
+        // Free (LLM-only, no credit) but it still costs OpenRouter money —
+        // log the measured cost.
+        void logUsage({
+            userId: req.user.id, provider: 'openrouter', operation: 'regenerate_captions',
+            success: true, snapitCredits: 0,
+            model: result.usage?.model, openrouterCostUsd: result.usage?.costUsd,
+            promptTokens: result.usage?.promptTokens, completionTokens: result.usage?.completionTokens,
+            requestId: result.usage?.requestId, meta: { ms: Date.now() - started, platform },
+        });
         res.status(200).json({
             success: true,
             caption: result.caption,
@@ -301,6 +346,10 @@ app.post('/api/regenerate/captions', requireToken, paidLimiter, upload.single('i
         });
     } catch (error) {
         log.error({ err: error, ms: Date.now() - started }, `regen.captions.failed: ${error.message}`);
+        void logUsage({
+            userId: req.user.id, provider: 'openrouter', operation: 'regenerate_captions',
+            success: false, snapitCredits: 0, meta: { ms: Date.now() - started, platform, error: error.message },
+        });
         res.status(502).json({ success: false, error: 'Caption regeneration failed. Please try again.' });
     }
 });
@@ -343,10 +392,21 @@ app.post('/api/regenerate/background', requireToken, paidLimiter, upload.single(
     const log = logger.child({ route: 'regenerate.background', seedMode: shouldFixSeed ? 'fix' : 'vary' });
     log.info('regen.bg.start');
 
+    // Two upstream calls here — the OpenRouter prompt-merge (free, measured cost)
+    // and the Photoroom image (1 credit, no cost reported). Each gets its own
+    // usage row. `refined` stays in scope so the catch can tell which one failed.
+    let refined;
     try {
-        const refined = await refineBackgroundPrompt(originalBackgroundPrompt, changePrompt);
+        refined = await refineBackgroundPrompt(originalBackgroundPrompt, changePrompt);
         const refinePromptMs = Date.now() - started;
         log.info({ ms: refinePromptMs }, 'regen.bg.prompt_merged');
+        void logUsage({
+            userId: req.user.id, provider: 'openrouter', operation: 'refine_background_prompt',
+            success: true, snapitCredits: 0,
+            model: refined.usage?.model, openrouterCostUsd: refined.usage?.costUsd,
+            promptTokens: refined.usage?.promptTokens, completionTokens: refined.usage?.completionTokens,
+            requestId: refined.usage?.requestId, meta: { ms: refinePromptMs },
+        });
 
         const bgStart = Date.now();
         const bgResult = await processImageBackground(
@@ -364,6 +424,10 @@ app.post('/api/regenerate/background', requireToken, paidLimiter, upload.single(
             },
             'regen.bg.done'
         );
+        void logUsage({
+            userId: req.user.id, provider: 'photoroom', operation: 'regenerate_background',
+            success: true, snapitCredits: 1, meta: { ms: Date.now() - bgStart, seed: bgResult.seed },
+        });
 
         res.status(200).json({
             success: true,
@@ -376,6 +440,12 @@ app.post('/api/regenerate/background', requireToken, paidLimiter, upload.single(
         abortController.abort();
         await refundCredit(req.user.id); // didn't deliver — don't charge
         log.error({ err: error, ms: Date.now() - started }, `regen.bg.failed: ${error.message}`);
+        // Attribute the failure to whichever call we hadn't yet completed.
+        void logUsage(refined === undefined
+            ? { userId: req.user.id, provider: 'openrouter', operation: 'refine_background_prompt',
+                success: false, snapitCredits: 0, meta: { ms: Date.now() - started, error: error.message } }
+            : { userId: req.user.id, provider: 'photoroom', operation: 'regenerate_background',
+                success: false, snapitCredits: 0, meta: { ms: Date.now() - started, error: error.message } });
         res.status(502).json({ success: false, error: 'Background regeneration failed. Please try again.' });
     }
 });
@@ -406,6 +476,9 @@ async function processJob(jobId, file, body, userId) {
 
     jobLog.info({ shouldGenerateBg: body.generateBackground === 'true' }, 'job.start');
 
+    // Declared outside the try so the catch can attribute a failure to the right
+    // upstream call (copy vs background) for the usage log.
+    let copyResult = null;
     try {
         const imageBuffer = file.buffer;
         const mimeType = file.mimetype;
@@ -413,8 +486,17 @@ async function processJob(jobId, file, body, userId) {
         const shouldGenerateBg = body.generateBackground === 'true';
 
         const copyStart = Date.now();
-        const copyResult = await generateMarketingCopy(imageBuffer, mimeType, body);
+        copyResult = await generateMarketingCopy(imageBuffer, mimeType, body);
         jobLog.info({ provider: copyResult.provider, ms: Date.now() - copyStart }, 'job.copy_done');
+        // The /api/generate credit (1) is charged for the whole action — attribute
+        // it to the always-present copy row; the bg row below carries 0.
+        void logUsage({
+            userId, jobId, provider: 'openrouter', operation: 'generate_copy',
+            success: true, snapitCredits: 1,
+            model: copyResult.usage?.model, openrouterCostUsd: copyResult.usage?.costUsd,
+            promptTokens: copyResult.usage?.promptTokens, completionTokens: copyResult.usage?.completionTokens,
+            requestId: copyResult.usage?.requestId, meta: { ms: Date.now() - copyStart },
+        });
 
         let generatedImageBase64 = null;
         let bgSeed = null;
@@ -438,6 +520,10 @@ async function processJob(jobId, file, body, userId) {
                 },
                 'job.bg_done'
             );
+            void logUsage({
+                userId, jobId, provider: 'photoroom', operation: 'background',
+                success: true, snapitCredits: 0, meta: { ms: Date.now() - bgStart, seed: bgSeed },
+            });
         }
 
         jobs.set(jobId, {
@@ -472,6 +558,13 @@ async function processJob(jobId, file, body, userId) {
         jobLog.error({ err: error, totalMs: Date.now() - started }, `job.failed: ${errorMessage}`);
         // The credit was consumed at request time; the job failed, so refund it.
         await refundCredit(userId);
+        // Attribute the failure: if copyResult is null the copy (OpenRouter) call
+        // failed; otherwise the background (Photoroom) call did.
+        void logUsage(copyResult === null
+            ? { userId, jobId, provider: 'openrouter', operation: 'generate_copy',
+                success: false, snapitCredits: 0, meta: { error: errorMessage } }
+            : { userId, jobId, provider: 'photoroom', operation: 'background',
+                success: false, snapitCredits: 0, meta: { error: errorMessage } });
         jobs.set(jobId, { status: 'failed', data: null, error: errorMessage });
     }
 

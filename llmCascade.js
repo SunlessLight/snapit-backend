@@ -53,7 +53,21 @@ async function callOpenRouter(model, prompt, schema, imageBase64, mimeType) {
         if (!messageContent) throw new Error('empty response content');
 
         const cleaned = messageContent.replace(/^```json\s*/i, '').replace(/\s*```$/i, '').trim();
-        return JSON.parse(cleaned);
+        const data = JSON.parse(cleaned);
+
+        // OpenRouter returns the authoritative per-request cost (USD) + token
+        // counts inline in `usage`. This is the ONLY one of our three upstreams
+        // that reports cost in-band, so we capture it here and surface it up the
+        // cascade for the usage log (see usageLog.js / phase7b_usage.sql).
+        const u = json?.usage || {};
+        const usage = {
+            model: json?.model || model,
+            costUsd: typeof u.cost === 'number' ? u.cost : null,
+            promptTokens: u.prompt_tokens ?? null,
+            completionTokens: u.completion_tokens ?? null,
+            requestId: json?.id || null,
+        };
+        return { data, usage };
     } finally {
         clearTimeout(timer);
     }
@@ -68,10 +82,13 @@ export async function generateWithCascade(prompt, schema, imageBase64, mimeType)
         const started = Date.now();
 
         try {
-            const result = await callOpenRouter(model, prompt, schema, imageBase64, mimeType);
+            const { data, usage } = await callOpenRouter(model, prompt, schema, imageBase64, mimeType);
             const latency = Date.now() - started;
-            logger.info({ tier: tierNum, model, latencyMs: latency }, 'llm.tier_ok');
-            return { ...result, provider: label };
+            logger.info({ tier: tierNum, model, latencyMs: latency, costUsd: usage.costUsd }, 'llm.tier_ok');
+            // `usage` carries the measured cost/tokens for the usage log. Callers
+            // build their own return/HTTP shapes, so this extra key never leaks
+            // into a client response.
+            return { ...data, provider: label, usage: { ...usage, latencyMs: latency } };
         } catch (err) {
             const latency = Date.now() - started;
             const reason = err.name === 'AbortError' ? `timeout after ${TIMEOUT_MS}ms` : err.message;

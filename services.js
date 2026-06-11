@@ -272,6 +272,8 @@ export async function generateMarketingCopy(imageBuffer, mimeType, params) {
         captions,
         backgroundPrompt: result.backgroundPrompt,
         provider: result.provider,
+        // Measured OpenRouter cost/tokens (see llmCascade.js) for the usage log.
+        usage: result.usage,
     };
 };
 
