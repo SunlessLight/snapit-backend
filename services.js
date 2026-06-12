@@ -400,21 +400,23 @@ export async function refineBackgroundPrompt(originalBackgroundPrompt, changePro
     return await generateWithCascade(prompt, schema);
 }
 
-// A single operation chain to get general enhancing in all areas of picture taken
+// Upscale-only operation set. Claid's editing API bills PER applied AI operation,
+// so the old chain (upscale + polish + adjustments) cost 3 credits per enhance.
+// `polish` (AI sharpen) and the `adjustments` block (hdr/sharpness/saturation) were
+// each a separate billed op and are now reproduced client-side for free — the tonal
+// pop via the adaptive local-enhance bake (recommendLocalEnhance → createProcessedBlob)
+// and crispness via a sharpen convolution. `upscale: smart_enhance` is the only op kept
+// because ML super-resolution (rendering genuinely new pixels) can't be faked on canvas.
+// `decompress` + `resizing` are free/bundled (never billed) — resizing is load-bearing:
+// `upscale` is a no-op without target dimensions.
 const CLAID_FOOD_OPERATIONS = {
     "restorations": {
         "decompress": 'auto',
-        "upscale": 'smart_enhance',
-        "polish": true
+        "upscale": 'smart_enhance'
     },
     "resizing": {
         "width": "120%",
         "height": "120%",
-    },
-    "adjustments": {
-        "hdr": { "intensity": 60 },
-        "sharpness": 10,
-        "saturation": 15,
     }
 };
 
